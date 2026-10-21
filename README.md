@@ -1,5 +1,9 @@
 # PandaCode
 
+> This is a fork of [PandaCode](https://github.com/aicodeking/pandacode). It
+> publishes an AppImage built on Arch Linux; see
+> [docs/linux-appimage-arch.md](docs/linux-appimage-arch.md).
+
 A small, native desktop workspace for coding agents. PandaCode runs the coding
 CLIs you already use — **Claude Code, Codex, Kimi Code, OpenCode, GLM Coding
 Plan and Xiaomi MiMo** (through Claude Code), **Antigravity and xAI's Grok
