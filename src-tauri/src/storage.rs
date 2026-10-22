@@ -108,6 +108,8 @@ pub struct Session {
     /// A mirror of a task that runs on another computer (docs/remote-access.md).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_device: Option<RemoteDevice>,
+    /// The agent's plan for this task, shown in the sidebar while it works.
+    pub todos: Vec<crate::todo::TodoItem>,
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct RemoteDevice {
@@ -156,7 +158,7 @@ pub struct Store {
 type Result<T> = std::result::Result<T, String>;
 /// The newest `PRAGMA user_version`. Every migration step below must run for any
 /// database older than this, so the guard reads this constant, never a literal.
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 const SIDEBAR_ORDER: &str = "pinned DESC,sidebar_order IS NULL,sidebar_order,COALESCE(MAX(last_response_at,last_prompt_at),last_response_at,last_prompt_at,created_at) DESC,id";
 
@@ -420,6 +422,14 @@ impl Store {
                 }
                 migration.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS sessions_remote ON sessions(remote_device,remote_session) WHERE remote_session IS NOT NULL; PRAGMA user_version=26;").map_err(|e| e.to_string())?;
             }
+            if version < 27 {
+                // The agent's plan checklist, drawn in the sidebar while a task works.
+                let exists: bool = migration.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='todos')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if !exists {
+                    migration.execute_batch("ALTER TABLE sessions ADD COLUMN todos TEXT;").map_err(|e| e.to_string())?;
+                }
+                migration.execute_batch("PRAGMA user_version=27;").map_err(|e| e.to_string())?;
+            }
             migration.commit().map_err(|e| e.to_string())?;
         }
         let recovery = db.transaction().map_err(|e| e.to_string())?;
@@ -644,6 +654,7 @@ impl Store {
                 .and_then(|s| serde_json::from_str(&s).ok()),
             worktree_branch: r.get(21)?,
             remote_device: r.get::<_, Option<String>>(29)?.map(|id| RemoteDevice { name: crate::remote::device_label(&id), id }),
+            todos: crate::todo::parse(r.get::<_, Option<String>>(30)?),
             issue: None,
             pull_request: None,
         })
@@ -651,7 +662,7 @@ impl Store {
     pub fn sessions(&self) -> Result<Vec<Session>> {
         // Lists only need a card preview. Full details remain in SQLite and are
         // fetched for the selected task or directly for an agent's Start prompt.
-        let mut stmt=self.db.prepare(&format!("SELECT id,project_id,title,provider,model,mode,status,created_at,updated_at,archived,resume_id,last_response_at,worktree_path,reasoning_effort,context_used_tokens,context_window,task_stage,substr(task_description,1,512),completed_at,goal_state,codex_settings,worktree_branch,last_prompt_at,pinned,sidebar_order,draft,limited_at,limited_until,resume_at_reset,remote_device FROM sessions WHERE draft=0 AND id NOT IN (SELECT session_id FROM architect_workers) ORDER BY {SIDEBAR_ORDER} LIMIT 500")).map_err(|e|e.to_string())?;
+        let mut stmt=self.db.prepare(&format!("SELECT id,project_id,title,provider,model,mode,status,created_at,updated_at,archived,resume_id,last_response_at,worktree_path,reasoning_effort,context_used_tokens,context_window,task_stage,substr(task_description,1,512),completed_at,goal_state,codex_settings,worktree_branch,last_prompt_at,pinned,sidebar_order,draft,limited_at,limited_until,resume_at_reset,remote_device,todos FROM sessions WHERE draft=0 AND id NOT IN (SELECT session_id FROM architect_workers) ORDER BY {SIDEBAR_ORDER} LIMIT 500")).map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([], Self::session_row)
             .map_err(|e| e.to_string())?;
@@ -662,7 +673,7 @@ impl Store {
         Ok(sessions)
     }
     pub fn session(&self, sid: &str) -> Result<Session> {
-        let mut session = self.db.query_row("SELECT id,project_id,title,provider,model,mode,status,created_at,updated_at,archived,resume_id,last_response_at,worktree_path,reasoning_effort,context_used_tokens,context_window,task_stage,task_description,completed_at,goal_state,codex_settings,worktree_branch,last_prompt_at,pinned,sidebar_order,draft,limited_at,limited_until,resume_at_reset,remote_device FROM sessions WHERE id=?1",[sid],Self::session_row).optional().map_err(|e|e.to_string())?.ok_or_else(||String::from("Conversation not found."))?;
+        let mut session = self.db.query_row("SELECT id,project_id,title,provider,model,mode,status,created_at,updated_at,archived,resume_id,last_response_at,worktree_path,reasoning_effort,context_used_tokens,context_window,task_stage,task_description,completed_at,goal_state,codex_settings,worktree_branch,last_prompt_at,pinned,sidebar_order,draft,limited_at,limited_until,resume_at_reset,remote_device,todos FROM sessions WHERE id=?1",[sid],Self::session_row).optional().map_err(|e|e.to_string())?.ok_or_else(||String::from("Conversation not found."))?;
         self.attach_links(std::slice::from_mut(&mut session))?;
         Ok(session)
     }
@@ -1243,6 +1254,17 @@ impl Store {
                     usage.context_window.map(|window| window as i64)
                 ],
             )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Conversation not found.".into());
+        }
+        Ok(())
+    }
+    /// Replaces a task's plan checklist; an empty list clears it.
+    pub fn set_todos(&self, sid: &str, todos: &[crate::todo::TodoItem]) -> Result<()> {
+        let changed = self
+            .db
+            .execute("UPDATE sessions SET todos=?2 WHERE id=?1", params![sid, crate::todo::encode(todos)?])
             .map_err(|e| e.to_string())?;
         if changed == 0 {
             return Err("Conversation not found.".into());

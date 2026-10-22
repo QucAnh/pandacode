@@ -114,6 +114,13 @@ pub(super) fn configuration(mode: &str) -> String {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     inline["permission"] = permission.clone();
+    // The sidebar plan is pandacode_plan; the harness's own todo list never
+    // reaches the user, so it is not offered.
+    if !inline["tools"].is_object() {
+        inline["tools"] = json!({});
+    }
+    inline["tools"]["todowrite"] = json!(false);
+    inline["tools"]["todoread"] = json!(false);
     if !inline["agent"].is_object() {
         inline["agent"] = json!({});
     }
@@ -1471,6 +1478,8 @@ mod tests {
         assert_eq!(full["permission"]["*"], "allow");
         assert_eq!(full["agent"]["build"]["permission"]["*"], "allow");
         assert_eq!(full["agent"]["plan"]["permission"]["*"], "allow");
+        assert_eq!(full["tools"]["todowrite"], false);
+        assert_eq!(full["tools"]["todoread"], false);
     }
 
     #[test]

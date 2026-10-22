@@ -20,8 +20,22 @@ const sampleTestOutput = 'PASS src/components/search.test.ts\n  ✓ filters resu
 function encodeTool(tool: ToolActivity): string { return JSON.stringify({ type: 'tool_activity', version: 1, ...tool }); }
 let projects: Project[] = [{ id: 'project-1', name: 'orbit', path: '/Users/you/Projects/orbit' }, { id: 'project-2', name: 'pandacode', path: '/Users/you/Projects/pandacode' }];
 let sessions: Session[] = [
-  { id: 'session-1', projectId: 'project-1', title: 'Make search feel instant', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 420000, updatedAt: now, archived: false, worktreePath: null, resumeId: 'preview-session', lastResponseAt: now - 300000 },
-  { id: 'session-2', projectId: 'project-1', title: 'Refine the navigation', provider: 'codex', model: '', mode: 'ask', status: 'idle', createdAt: now - 8200000, updatedAt: now - 8000000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: null },
+  { id: 'session-1', projectId: 'project-1', title: 'Make search feel instant', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 420000, updatedAt: now, archived: false, worktreePath: null, resumeId: 'preview-session', lastResponseAt: now - 300000, todos: [
+    { text: 'Trace the search input and how it rebuilds results on every keystroke', status: 'done' },
+    { text: 'Move the search index out of the input handler', status: 'done' },
+    { text: 'Measure the typing latency before and after', status: 'done' },
+    { text: 'Keep keyboard navigation working while results update', status: 'active' },
+    { text: 'Add a regression test for fast typing', status: 'pending' },
+    { text: 'Check the empty-query and one-character cases', status: 'pending' },
+    { text: 'Re-run the full suite', status: 'pending' },
+    { text: 'Update the search section of the README', status: 'pending' },
+    { text: 'Ask for a review of the diff', status: 'pending' },
+  ] },
+  { id: 'session-2', projectId: 'project-1', title: 'Refine the navigation', provider: 'codex', model: '', mode: 'ask', status: 'idle', createdAt: now - 8200000, updatedAt: now - 8000000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: null, todos: [
+    { text: 'Read the sidebar styles', status: 'done' },
+    { text: 'Tighten the folder spacing', status: 'pending' },
+    { text: 'Check the narrow layout', status: 'pending' },
+  ] },
   { id: 'session-3', projectId: 'project-1', title: 'Add keyboard shortcuts', provider: 'kimi', model: '', mode: 'ask', status: 'idle', createdAt: now - 86400000, updatedAt: now - 86400000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: null },
   { id: 'session-4', projectId: 'project-2', title: 'Explore the project', provider: 'codex', model: '', mode: 'ask', status: 'idle', createdAt: now - 345600000, updatedAt: now - 172800000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: now - 259200000 },
 ];

@@ -35,7 +35,8 @@ export const appUpdates = (): AppUpdates | undefined => instance;
 
 export function startAppUpdates(host: UpdatesHost): AppUpdates {
   const listeners = new Set<() => void>();
-  let state: UpdateState = preview ? { kind: 'off' } : { kind: 'idle' };
+  const dev = import.meta.env.DEV || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost';
+  let state: UpdateState = preview || dev ? { kind: 'off' } : { kind: 'idle' };
   let automatic = (() => { try { return localStorage.getItem(KEY) !== 'off'; } catch { return true; } })();
   let pending: Pending | null = null, lastCheck = 0, lastInput = Date.now(), checking: Promise<void> | null = null;
   const set = (next: UpdateState) => { state = next; listeners.forEach(listener => listener()); };
@@ -52,7 +53,7 @@ export function startAppUpdates(host: UpdatesHost): AppUpdates {
   }
 
   async function run(): Promise<void> {
-    if (preview || state.kind === 'downloading' || state.kind === 'ready' || state.kind === 'installing') return;
+    if (preview || dev || state.kind === 'downloading' || state.kind === 'ready' || state.kind === 'installing') return;
     lastCheck = Date.now();
     set({ kind: 'checking' });
     try {
