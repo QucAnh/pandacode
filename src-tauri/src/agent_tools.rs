@@ -386,10 +386,6 @@ pub fn host_for(
     build_host(tools_for(provider), app, session_id, stopped)
 }
 
-pub fn host(app: tauri::AppHandle, session_id: String, stopped: Arc<AtomicBool>) -> ToolHost {
-    build_host(catalog(), app, session_id, stopped)
-}
-
 fn build_host(
     tools: Vec<Value>,
     app: tauri::AppHandle,
