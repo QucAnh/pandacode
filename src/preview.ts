@@ -181,7 +181,13 @@ const catalogs: Record<ProviderId, ProviderModel[]> = {
   ],
   'github-copilot': [{ id: 'default', name: 'Default', description: 'Use the model configured in GitHub Copilot CLI.' }],
   opencode: openCodePreviewModels,
-  glm: [{ id: 'glm-4.7', name: 'GLM-4.7', description: 'Z.ai Coding Plan via Claude Code.' }],
+  glm: [
+    { id: 'glm-5.3', name: 'GLM-5.3', description: 'Current flagship. Availability depends on your plan.' },
+    { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', description: 'Fast, low-cost tier. Availability depends on your plan.' },
+    { id: 'glm-5.3[1m]', name: 'GLM-5.3 · 1M context', description: 'Flagship with the extended 1M-token context window. Availability depends on your plan.' },
+    { id: 'glm-5.3-flash[1m]', name: 'GLM-5.3-Flash · 1M context', description: 'Fast tier with the extended 1M-token context window. Availability depends on your plan.' },
+    { id: 'glm-5-turbo', name: 'GLM-5-Turbo', description: 'Fast general-purpose model. Availability depends on your plan.' },
+  ],
   mimo: [
     { id: 'mimo-v2.6-pro', name: 'MiMo-V2.6-Pro', description: 'Flagship. Token Plan and pay-as-you-go. Availability depends on your plan.' },
     { id: 'mimo-v2.6-pro[1m]', name: 'MiMo-V2.6-Pro · 1M context', description: 'Flagship with the extended 1M-token context window. Availability depends on your plan.' },
@@ -721,6 +727,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     case 'architect_get': result = architect.get(args.sessionId); break;
     case 'architect_configure': result = architect.configure(args.sessionId, args.config, args.architect, args.profileId); break;
     case 'architect_profiles': result = architect.profiles(); break;
+    case 'architect_set_lead_guidance': result = architect.setLeadGuidance(args.guidance); break;
     case 'architect_save_profile': result = architect.saveProfile(args.id, args.name, args.setup); break;
     case 'architect_delete_profile': result = architect.deleteProfile(args.id); break;
     case 'architect_start': architect.start(args.sessionId, args.text, args.imageIds); break;
