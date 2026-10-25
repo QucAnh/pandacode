@@ -34,13 +34,17 @@ mod claude_stream_tests;
 mod codex_stream_tests;
 #[cfg(all(test, unix))]
 pub(crate) mod concurrent_process_tests;
+mod cline;
 mod commandcode;
 mod extra_models;
 mod github_copilot;
+mod devin;
 mod glm;
 mod mimo;
+mod muse;
 mod deepseek;
 mod kimi_models;
+mod kilo;
 mod launch;
 mod pi;
 mod diagnostics;
@@ -51,6 +55,7 @@ mod kimi_stream_tests;
 #[cfg(test)]
 mod slash_command_tests;
 mod limits;
+mod plan_reads;
 mod steering;
 mod subagents;
 mod text_stream;
@@ -65,7 +70,7 @@ const TOOL_INPUT_LIMIT: usize = 4096;
 const TOOL_OUTPUT_LIMIT: usize = 8192;
 const TOOL_CACHE_LIMIT: usize = 64;
 const PREVIEW_TRUNCATED: &str = "\n[Preview truncated]";
-const PROVIDERS: [(&str, &str); 13] = [
+pub(crate) const PROVIDERS: [(&str, &str); 17] = [
     ("claude", "Claude Code"),
     ("codex", "Codex"),
     ("kimi", "Kimi Code"),
@@ -77,12 +82,24 @@ const PROVIDERS: [(&str, &str); 13] = [
     ("pi", "Pi"),
     ("deepseek", "DeepSeek"),
     ("commandcode", "Command Code"),
+    ("cline", "Cline"),
+    ("kilo", "Kilo Code"),
     ("omp", "Oh My Pi"),
     ("github-copilot", "GitHub Copilot CLI"),
+    ("muse", "Muse Code"),
+    ("devin", "Devin CLI"),
 ];
 
 /// Claude Code tools that only report back to a session that stays open after its turn.
 pub(crate) const CLAUDE_SESSION_BOUND_TOOLS: &str = "ScheduleWakeup,Monitor,CronCreate";
+
+/// Never runs an agent-reviewed task under some other policy.
+fn review_supported(provider: &str, mode: &str) -> Result<(), String> {
+    if mode == "review" && !matches!(provider, "claude" | "glm" | "mimo") {
+        return Err("Approve for me needs Claude Code's auto mode; this harness has no agent-reviewed approvals. Choose another access mode.".into());
+    }
+    Ok(())
+}
 
 /// Harnesses that take app instructions as a system prompt (`--append-system-prompt`).
 pub fn takes_system_instructions(provider: &str) -> bool {
@@ -390,7 +407,9 @@ struct PartialTool {
 pub enum RunInput {
     Stop,
     /// A message for the agent while it works: injected mid-turn where the harness supports it.
+    /// The reply is `{"steered":true,"id","mode":"live"|"next-turn"}`; `steer` events follow its delivery.
     Steer {
+        id: String,
         text: String,
         reply: tokio::sync::oneshot::Sender<Result<Value, String>>,
     },
@@ -449,14 +468,14 @@ pub fn validate_reasoning_effort(provider: &str, effort: Option<&str>) -> Result
     let valid = match (provider, effort) {
         (
             "claude" | "codex" | "kimi" | "glm" | "opencode" | "antigravity" | "grok" | "mimo"
-            | "pi" | "deepseek" | "commandcode" | "omp" | "github-copilot",
+            | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin",
             None,
         ) => true,
         ("claude" | "glm" | "mimo", Some(value)) => {
             ["low", "medium", "high", "xhigh", "max"].contains(&value)
         }
         // The current app-server schema deliberately permits catalog-defined effort IDs.
-        ("codex" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode", Some(value)) => {
+        ("codex" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "devin", Some(value)) => {
             !value.is_empty()
                 && value.len() <= 64
                 && value
@@ -465,6 +484,7 @@ pub fn validate_reasoning_effort(provider: &str, effort: Option<&str>) -> Result
         }
         ("pi" | "omp", Some(value)) => ["off", "minimal", "low", "medium", "high", "xhigh"].contains(&value),
         ("kimi", Some(value)) => ["on", "off"].contains(&value),
+        ("muse", Some(value)) => muse::valid_effort(value),
         _ => false,
     };
     if valid {
@@ -505,7 +525,7 @@ pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     if let Some(path) = crate::provider_settings::executable_override(name) {
         return Some(path);
     }
-    launch::find(executable_name(name))
+    launch::find(executable_name(name)).or_else(|| if name == "devin" { devin::bundled() } else { None })
 }
 
 fn executable_name(name: &str) -> &str {
@@ -535,9 +555,21 @@ pub(crate) fn commandcode_key_environment(command: &mut Command) -> Option<Strin
     commandcode::key_environment(command)
 }
 
+/// Muse Code's process sandbox flags for a PandaCode mode, shared with its console.
+pub(crate) fn muse_sandbox_args(mode: &str) -> &'static [&'static str] {
+    muse::sandbox_args(mode)
+}
+
 pub(crate) fn grok_permission_mode(mode: &str) -> &'static str {
     acp::grok_permission_mode(mode)
 }
+
+/// Devin's commands for a project, from a discovery session it deletes afterwards.
+pub(crate) async fn devin_commands(path: &Path, cwd: &Path) -> Result<Option<Value>, String> {
+    devin::commands(path, cwd).await
+}
+
+pub(crate) use devin::HIDDEN_COMMANDS as DEVIN_HIDDEN_COMMANDS;
 
 pub(crate) fn glm_arguments() -> Vec<String> {
     glm::arguments()
@@ -679,7 +711,7 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
     let semaphore = &model_discovery_semaphores()[index];
     let _permit = if matches!(
         provider,
-        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "github-copilot"
+        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "muse" | "devin"
     ) {
         // Saving models refreshes both windows. Queue their bounded metadata
         // queries so one window does not cache incomplete ID-only fallbacks.
@@ -705,7 +737,11 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
         "pi" | "omp" => pi::models(&path, provider).await,
         "deepseek" => deepseek::models(&path).await,
         "commandcode" => commandcode::models(&path).await,
+        "cline" => cline::models(&path).await,
+        "kilo" => kilo::models(&path).await,
         "github-copilot" => github_copilot::models(&path).await,
+        "muse" => muse::models(&path).await,
+        "devin" => devin::models(&path).await,
         _ => unreachable!(),
     }
 }
@@ -1026,8 +1062,9 @@ struct Protocol {
     remote_id: String,
     turn_id: String,
     phase: u8,
-    /// Steering messages written to Claude Code that it has not yet echoed back as consumed.
-    steers_pending: usize,
+    /// Steering messages this run has accepted but not yet delivered.
+    steers: steering::Steers,
+    acp_steers: acp::Steers,
     /// Latest Codex rate-limit snapshot, for the reset time of a usage-limit error.
     codex_limits: Value,
     /// Claude echoes the opening prompt first; later echoes are steering messages.
@@ -1045,6 +1082,7 @@ struct Protocol {
     kimi_message_id: String,
     kimi_resume: bool,
     pi: pi::State,
+    muse: muse::State,
     // ACP may publish commands before session/new responds. Keep at most one
     // small frame until the response confirms which session owns it.
     early_kimi_commands: Option<Vec<u8>>,
@@ -1156,7 +1194,8 @@ impl Protocol {
             config,
             turn_id: String::new(),
             phase: 0,
-            steers_pending: 0,
+            steers: Default::default(),
+            acp_steers: Default::default(),
             codex_limits: Value::Null,
             prompt_replayed: false,
             pending: HashMap::new(),
@@ -1172,6 +1211,7 @@ impl Protocol {
             kimi_message_id: String::new(),
             kimi_resume: false,
             pi: pi::State::default(),
+            muse: muse::State::default(),
             early_kimi_commands: None,
             tools: HashMap::new(),
             file_write_tools: HashSet::new(),
@@ -1251,7 +1291,7 @@ impl Protocol {
         // not retain a second copy for the rest of a potentially long turn.
         let mut content = std::mem::take(&mut self.image_blocks);
         let mut text = std::mem::take(&mut self.config.prompt);
-        if matches!(self.config.provider.as_str(), "grok" | "deepseek") && self.config.mode == "plan" && !text.trim().is_empty() {
+        if matches!(self.config.provider.as_str(), "grok" | "deepseek" | "muse") && self.config.mode == "plan" && !text.trim().is_empty() {
             text = format!("{}\n\n{text}", acp::GROK_PLAN_PREFIX);
         }
         if !text.trim().is_empty() {
@@ -1620,13 +1660,14 @@ impl Protocol {
     fn initial(&self) -> Value {
         match self.config.provider.as_str() {
             "pi" | "omp" => json!({"type":"get_state","id":"pandacode-init"}),
+            "muse" => self.muse_initial(),
             "codex" => {
                 let mut request = json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"pandacode","title":"PandaCode","version":"0.1.0"}}});
                 request["params"]["capabilities"] =
                     json!({"experimentalApi":true,"requestAttestation":false});
                 request
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "github-copilot" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" => {
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"pandacode","version":"0.1.0"}}})
             }
             _ => {
@@ -1646,6 +1687,13 @@ impl Protocol {
         Ok(())
     }
     fn approve(&mut self, id: &str, approved: bool) -> Option<Value> {
+        if self.config.provider == "muse" {
+            // Muse decides only with a choice it offered; keep the prompt when none fits.
+            let request = self.pending.get(id)?.clone();
+            let decision = self.muse_decide(&request, approved)?;
+            self.pending.remove(id);
+            return Some(decision);
+        }
         let request = self.pending.remove(id)?;
         Some(match self.config.provider.as_str() {
             "pi" | "omp" => json!({"type":"extension_ui_response","id":request["id"],"confirmed":approved}),
@@ -1658,7 +1706,8 @@ impl Protocol {
                 };
                 json!({"id":request["id"],"result":result})
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "github-copilot" => {
+            "devin" => devin::decision(&request, approved),
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" => {
                 let options = request["params"]["options"].as_array();
                 let kinds = if approved {
                     ["allow_once", "allow_always"]
@@ -1681,10 +1730,11 @@ impl Protocol {
     fn cancel(&self) -> Value {
         match self.config.provider.as_str() {
             "pi" | "omp" => json!({"type":"abort"}),
+            "muse" => self.muse_cancel(),
             "codex" => {
                 json!({"id":900,"method":"turn/interrupt","params":{"threadId":self.remote_id,"turnId":self.turn_id}})
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "github-copilot" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" => {
                 json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.remote_id}})
             }
             _ => {
@@ -1710,15 +1760,23 @@ impl Protocol {
     }
     fn receive_inner(&mut self, value: Value) -> Result<Step, String> {
         match self.config.provider.as_str() {
-            "codex" => self.codex(value),
-            "kimi" => self.kimi(value),
-            "pi" | "omp" => self.pi(value),
-            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "github-copilot" => self.acp(value),
+            "codex" => self.codex(value).map(|step| self.steered(step)),
+            "kimi" => self.kimi_steered(value),
+            "pi" | "omp" => self.pi(value).map(|step| self.steered(step)),
+            "muse" => self.muse(value),
+            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" => self.acp(value),
             _ => self.claude(value),
         }
     }
+    fn steered(&mut self, mut step: Step) -> Step {
+        self.steer_turn_end(&mut step);
+        step
+    }
     fn codex(&mut self, value: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        if self.codex_steer_response(&value, &mut step) {
+            return Ok(step);
+        }
         let method = string(&value, "method");
         let params = &value["params"];
         if !method.is_empty() {
@@ -1861,7 +1919,10 @@ impl Protocol {
                     } else {
                         self.remember_text_phase(field(item,"id"),item["phase"].as_str());
                     }
-                } else if kind!="userMessage" && kind!="reasoning" {
+                } else if kind=="userMessage" {
+                    // Codex echoes a steer as a user message when the turn takes it.
+                    if method=="item/started" { self.steers_consumed(&item["content"],&mut step); }
+                } else if kind!="reasoning" {
                     self.codex_tool(item,method=="item/completed",&mut step);
                 }
             },
@@ -2190,6 +2251,7 @@ impl Protocol {
                     request["message"]["content"] = content;
                     step.write.push(request);
                     self.phase = 1;
+                    self.claude_send_held(&mut step);
                 }
             }
             "system" if value["subtype"] == "init" => {
@@ -2360,7 +2422,7 @@ impl Protocol {
             }
             "user" => {
                 if value["isReplay"] == true {
-                    self.claude_replay();
+                    self.claude_replay(&value["message"]["content"], &mut step);
                 }
                 if let Some(content) = value["message"]["content"].as_array() {
                     for block in content {
@@ -2396,6 +2458,10 @@ impl Protocol {
                         // Bot tools are registered only in a bot's own tasks and only
                         // touch that bot's memory, schedules and messages to its owner.
                         // Team tools only exist in team turns and only change team state.
+                        step.write.push(json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"allow","updatedInput":value["request"]["input"]}}}));
+                    } else if self.config.mode == "plan" && plan_reads::plan_read_only(&name, &value["request"]["input"], &self.config.cwd) {
+                        // Plan mode investigates: reads and web lookups anywhere run;
+                        // Claude's own deny rules were applied before it asked.
                         step.write.push(json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"allow","updatedInput":value["request"]["input"]}}}));
                     } else {
                         self.approval(
@@ -2460,9 +2526,9 @@ impl Protocol {
                     let id = self.claude_text_id(&Value::Null);
                     self.text_snapshot(&id, None, text, &mut step);
                 }
-                // A steering message that arrived as the turn ended starts another turn;
-                // keep the run open for that turn's result unless this one failed.
-                step.done = self.steers_pending == 0 || value["is_error"] == true;
+                // A steer Claude has not echoed yet arrived as the turn ended: Claude
+                // starts another turn for it in this process, so keep the run open.
+                step.done = !self.claude_steers_open();
             }
             _ => {}
         }
@@ -2635,8 +2701,9 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
             command.args(["app-server", "--enable", "goals"]);
         }
         "pi" | "omp" => pi::configure(command, config),
-        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" => acp::configure(command, config),
-        "github-copilot" => acp::configure(command, config),
+        "muse" => muse::configure(command, config),
+        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" => acp::configure(command, config),
+        "github-copilot" | "devin" => acp::configure(command, config),
         "kimi" => {
             if use_model {
                 command.args(["--model", &config.model]);
@@ -2659,6 +2726,8 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
             ]);
             let permission_mode = match config.mode.as_str() {
                 "auto" => "acceptEdits",
+                // Claude Code's auto mode: its safety reviewer approves routine actions.
+                "review" => "auto",
                 "plan" => "plan",
                 "full" => "bypassPermissions",
                 _ => "default",
@@ -2710,8 +2779,12 @@ async fn run_inner(
         "pi",
         "deepseek",
         "commandcode",
+        "cline",
+        "kilo",
         "omp",
         "github-copilot",
+        "muse",
+        "devin",
     ]
     .contains(&config.provider.as_str())
     {
@@ -2720,8 +2793,14 @@ async fn run_inner(
     if !crate::storage::valid_permission_mode(&config.mode) {
         return Err("Unknown permission mode".into());
     }
+    review_supported(&config.provider, &config.mode)?;
     validate_reasoning_effort(&config.provider, config.reasoning_effort.as_deref())?;
-    let connection = crate::connections::for_task(&config.session_id, &config.provider)
+    // A cloud task runs the same pipeline through a bridge to its machine; local MCP host
+    // tools stay on this computer (docs/cloud-agents.md, step 5).
+    if let Some(command) = crate::cloud_agents::transport::command(&config, |command| configure_command(command, &config)).await? {
+        return run_process_with_tools(config, sink, input, command, Vec::new(), None).await;
+    }
+    let mut connection = crate::connections::for_task(&config.session_id, &config.provider)
         .map(|connection| crate::connections::launch(&connection))
         .transpose()?;
     let path = connection
@@ -2736,6 +2815,12 @@ async fn run_inner(
     // A named connection's arguments and environment win over the global setup.
     if let Some(connection) = &connection {
         connection.apply(&mut command);
+    }
+    if config.provider == "kilo" {
+        let inline = kilo::configure_environment(&mut command, &config);
+        if let Some(connection) = &mut connection {
+            connection.secrets.push(inline);
+        }
     }
     let key = if config.provider == "glm" {
         Some(glm::configure(&mut command)?)
@@ -2779,13 +2864,25 @@ async fn run_process(
 fn optional_metadata_tool(name: &str) -> bool {
     name == crate::session_titles::TOOL || name == crate::turn_changes::TRACK_TOOL
 }
-// Preview tools are an optional transport capability, but retain their normal
-// approval requirements and transcript activity. They are not metadata tools.
+// Preview, simulator, VM, design, cloud deploy, Jev, and bot tools are optional
+// transport capabilities, but retain their normal approval requirements and transcript
+// activity. They are not metadata tools.
 fn optional_transport_tool(name: &str) -> bool {
-    optional_metadata_tool(name) || matches!(name, "pandacode_run_project" | "pandacode_preview_file")
+    optional_metadata_tool(name)
+        || matches!(
+            name,
+            "pandacode_run_project" | "pandacode_preview_file" | "pandacode_cloud_cli"
+        )
+        || name.starts_with("pandacode_simulator_")
+        || name.starts_with("pandacode_vm_")
+        || name.starts_with("pandacode_design_")
+        || name.starts_with("pandacode_jev_")
+        || name.starts_with("pandacode_bot_")
 }
 fn per_run_mcp_tool(name: &str) -> bool {
-    name.starts_with("pandacode_jev_") || optional_transport_tool(name)
+    name.starts_with("pandacode_jev_")
+        || optional_metadata_tool(name)
+        || matches!(name, "pandacode_run_project" | "pandacode_preview_file")
 }
 
 fn split_jev_host(host: Option<ToolHost>) -> (Option<ToolHost>, Option<ToolHost>) {
@@ -2870,7 +2967,7 @@ async fn run_process_with_tools(
         }
         (
             "claude" | "glm" | "mimo" | "kimi" | "opencode" | "antigravity" | "grok" | "pi"
-            | "deepseek" | "commandcode" | "omp" | "github-copilot",
+            | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin",
             Some(host),
         ) => (
             None,
@@ -2944,10 +3041,10 @@ async fn run_process_with_tools(
                     match action {
                         Some(RunInput::Goal{request,reply})=>{let step=protocol.goal_control(request,reply);if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}},
                         Some(RunInput::CodexRequest{method,params,reply})=>{let step=protocol.codex_control(method,params,reply);apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;},
-                        Some(RunInput::Steer{text,reply})=>{let step=protocol.steer(text,reply);apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;},
+                        Some(RunInput::Steer{id,text,reply})=>{let step=protocol.steer(id,text,reply);apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;},
                         Some(RunInput::Approval{request_id,approved})=>{if !mcp.as_ref().is_some_and(|server|server.approve(&request_id,approved)) {let step=protocol.approval_step(&request_id,approved); apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;}},
                         Some(RunInput::UserInput{request_id,response,reply})=>{
-                            match protocol.user_input(&request_id,response) {
+                            match if protocol.config.provider=="muse" {protocol.muse_user_input(&request_id,response)} else {protocol.user_input(&request_id,response)} {
                                 Ok(step)=>{let result=apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await.map(|_|());if let Some(reply)=reply {let _=reply.send(result.clone());}result?;},
                                 Err(error)=>{if let Some(reply)=reply {let _=reply.send(Err(error));}},
                             }
@@ -3018,6 +3115,9 @@ async fn run_process_with_tools(
     jobs.abort_all();
     queued.clear();
     protocol.goals.cancel_pending();
+    for event in protocol.steers_ended(result.is_ok() && !stopped) {
+        sink(event);
+    }
     for event in protocol.cancel_requests().events {
         sink(event);
     }
@@ -3082,6 +3182,15 @@ mod tests {
         assert_eq!(executable_name("github-copilot"), "copilot");
         assert!(validate_reasoning_effort("github-copilot", None).is_ok());
         assert!(validate_reasoning_effort("github-copilot", Some("high")).is_err());
+    }
+
+    #[test]
+    fn kilo_is_registered_with_its_cli_and_catalog_defined_efforts() {
+        assert!(PROVIDERS.contains(&("kilo", "Kilo Code")));
+        assert_eq!(executable_name("kilo"), "kilo");
+        assert!(validate_reasoning_effort("kilo", None).is_ok());
+        assert!(validate_reasoning_effort("kilo", Some("max")).is_ok());
+        assert!(validate_reasoning_effort("kilo", Some("bad\nflag")).is_err());
     }
 
     pub(super) fn config(provider: &str) -> RunConfig {
@@ -3201,7 +3310,7 @@ mod tests {
 
     #[test]
     fn preview_tools_do_not_block_normal_acp_turns_when_http_mcp_is_unavailable() {
-        for provider in ["kimi", "opencode", "antigravity", "grok"] {
+        for provider in ["kimi", "opencode", "antigravity", "grok", "cline"] {
             let mut p = Protocol::new(config(provider));
             p.mcp_server = Some(json!({"type":"http","name":"pandacode_architect"}));
             p.mcp_required = ["pandacode_run_project", "pandacode_preview_file"].iter().any(|name| !optional_transport_tool(name));
@@ -3212,6 +3321,75 @@ mod tests {
             }
             assert_eq!(step.write[0]["method"], "session/new", "{provider}");
             assert_eq!(step.write[0]["params"]["mcpServers"], json!([]), "{provider}");
+        }
+    }
+
+    #[test]
+    fn optional_host_tools_do_not_block_normal_acp_turns_when_http_mcp_is_unavailable() {
+        for name in [
+            crate::session_titles::TOOL,
+            crate::turn_changes::TRACK_TOOL,
+            "pandacode_run_project",
+            "pandacode_preview_file",
+            "pandacode_cloud_cli",
+            "pandacode_simulator_tap",
+            "pandacode_vm_exec",
+            "pandacode_design_artboard",
+            "pandacode_jev_test",
+            "pandacode_bot_recall",
+        ] {
+            assert!(optional_transport_tool(name), "{name} should be optional transport");
+        }
+        for name in [
+            "pandacode_delegate",
+            "pandacode_send_team_message",
+            "pandacode_team_status",
+            "pandacode_read_file",
+        ] {
+            assert!(!optional_transport_tool(name), "{name} must be required");
+        }
+    }
+
+    #[test]
+    fn approve_for_me_runs_only_where_the_harness_reviews_actions() {
+        for provider in ["claude", "glm", "mimo"] {
+            assert!(review_supported(provider, "review").is_ok());
+        }
+        for provider in ["codex", "kimi", "opencode", "antigravity", "grok", "pi", "omp", "deepseek", "commandcode", "cline", "kilo", "github-copilot", "muse"] {
+            assert!(review_supported(provider, "review").unwrap_err().contains("Approve for me"), "{provider}");
+            assert!(review_supported(provider, "ask").is_ok());
+        }
+    }
+
+    #[test]
+    fn claude_plan_mode_runs_reads_and_web_lookups_but_asks_for_the_rest() {
+        let permission = |mode: &str, name: &str, input: Value| {
+            let mut cfg = config("claude");
+            cfg.mode = mode.into();
+            let mut p = Protocol::new(cfg);
+            let step = p.receive(json!({"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":name,"input":input}})).unwrap();
+            step.write.first().map(|w| w["response"]["response"]["behavior"].clone())
+        };
+        for (name, input) in [
+            ("Read", json!({"file_path":"/Users/me/other-repo/README.md"})),
+            ("Grep", json!({"pattern":"token","path":"/opt/lib"})),
+            ("Glob", json!({"pattern":"**/*.md","path":"/Users/me/docs"})),
+            ("WebFetch", json!({"url":"https://docs.example.com","prompt":"summary"})),
+            ("WebSearch", json!({"query":"tauri updater"})),
+        ] {
+            assert_eq!(permission("plan", name, input.clone()), Some(json!("allow")), "{name}");
+            assert_eq!(permission("ask", name, input), None, "{name} keeps Standard approvals");
+        }
+        // Credentials and anything that changes state still go to the user.
+        for (name, input) in [
+            ("Read", json!({"file_path":"/Users/me/.ssh/id_ed25519"})),
+            ("Read", json!({"file_path":"/Users/me/project/.env"})),
+            ("Glob", json!({"pattern":"/Users/me/.aws/*"})),
+            ("Write", json!({"file_path":"/tmp/a.txt","content":"x"})),
+            ("Edit", json!({"file_path":"/tmp/a.txt"})),
+            ("Bash", json!({"command":"cat README.md"})),
+        ] {
+            assert_eq!(permission("plan", name, input), None, "{name}");
         }
     }
 
@@ -3627,6 +3805,7 @@ mod tests {
             for (mode, expected) in [
                 ("ask", "default"),
                 ("auto", "acceptEdits"),
+                ("review", "auto"),
                 ("plan", "plan"),
                 ("full", "bypassPermissions"),
             ] {
@@ -4298,9 +4477,9 @@ mod tests {
     async fn smoke_provider_from_env() {
         use std::sync::Mutex;
         let provider = std::env::var("PANDACODE_SMOKE_PROVIDER")
-            .expect("Set PANDACODE_SMOKE_PROVIDER to claude, codex, or kimi");
+            .expect("Set PANDACODE_SMOKE_PROVIDER to claude, codex, kimi or muse");
         let model = std::env::var("PANDACODE_SMOKE_MODEL").unwrap_or_else(|_| "default".into());
-        assert!(["claude", "codex", "kimi"].contains(&provider.as_str()));
+        assert!(["claude", "codex", "kimi", "muse"].contains(&provider.as_str()));
         let root =
             std::env::temp_dir().join(format!("pandacode-provider-smoke-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();

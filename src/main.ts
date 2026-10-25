@@ -15,8 +15,8 @@ import './todo-card.css';
 import './usage-limit.css';
 import './document-viewer.css';
 import './tool-trace.css';
-import { renderDocument, setDocumentView } from './document-viewer';
-import { canSteer, moved, queuePanel, type HoldReason, type QueuedMessage } from './message-queue';
+import { setDocumentView } from './document-viewer';
+import { moved, queuePanel, type HoldReason, type QueuedMessage } from './message-queue';
 import { afterRun as turnChecksAfterRun, enabled as turnChecksEnabled, noteManualSend, setEnabled as turnChecksSetEnabled } from './turn-checks';
 import { limitActive, limitBanner, resetLabel } from './usage-limit';
 import { cascade, enterView, glideIn, glideOut, hideToast, installDialogMotion, publishSpringEasings, revealIn, showToast, trackSegment } from './motion';
@@ -30,6 +30,7 @@ import type { BrowserPanel } from './browser';
 import { call, chooseFolder, preview, subscribe } from './bridge';
 import { jjChip, showJjPanel, type JjStatus } from './jj';
 import { $, button, escape, fileIcon, fileIconsReady, icon, markdown, morph } from './dom';
+import { botAvatarHtml } from './bot-avatars';
 import { mountExternalLinks } from './external-links';
 import { bindMessageActions, messageActionsHtml } from './message-actions';
 import { providerLogo } from './provider-logos';
@@ -53,21 +54,25 @@ import { changeUiScale, initializeUiSizing, setUiScale } from './ui-size';
 import { approvalBarHtml } from './approval-bar';
 import { createThreadFind } from './thread-find';
 import type { RemoteHost, RemoteRepoCheck, RemoteStatus, RemoteTarget } from './remote-types';
-import { LOCAL, behindDialog, behindText, computerControl, computerItems } from './remote-target';
-import { botAvatar, botsBarHtml, botsListHtml, botsPanelHeadHtml, storedSidebarView, storeSidebarView, syncSeen, type SidebarView } from './sidebar-bots';
+import { CONNECT_SETUP, LOCAL, behindDialog, behindText, computerControl, computerItems } from './remote-target';
+import './cloud-agents.css';
+import { SETUP_CHOICE, cloudActionItems, cloudIcon, cloudProvider, cloudStrip, deleteMachineDialog, harnessRefusal, type CloudStage, type CloudTarget } from './cloud-agents';
+import { botsBarHtml, botsListHtml, botsPanelHeadHtml, storedSidebarView, storeSidebarView, syncSeen, type SidebarView } from './sidebar-bots';
 import { connectAgentUiActions, type AgentUiAction } from './agent-ui-actions';
 import { createAgentInput, type AgentInput } from './agent-input';
 import { mountSlashCommands, type SlashCommand } from './slash-commands';
 import { mountFileMentions, type MentionEntry } from './file-mentions';
+import { createFileTabs } from './file-tabs';
 import { bindFileLinkContext, configureFileLinks, isPreviewableFile, refreshFileLinks, type FileLinkContext, type ResolvedFile } from './file-links';
 import { createWorktrees } from './worktrees';
 import { createGithub, githubEnabled } from './github';
-import { startAppUpdates } from './app-updates';
+import { mountUpdatePill, startAppUpdates } from './app-updates';
 import { projectIconHtml } from './project-icons';
 import { createPullView } from './github-pull';
 import { createSearchPanel } from './search-panel';
 import { createTokenSaver } from './token-saver-panel';
 import { MAX_IMAGES, mountPromptAttachments, type PromptImage } from './attachments';
+import { attachmentChips, parseAttachments } from './message-attachments';
 import { compactSublines, infoMark, installTooltips } from './tooltip';
 import { isMac, isWindows, shortcut } from './platform';
 import { createGoalBanner, showGoalDialog, showCommandCenter, type GoalState, type GoalAction, type CommandPanel } from './command-center';
@@ -92,8 +97,8 @@ const state = {
   projectFilter: localStorage.getItem('pandacode.projectFilter') ?? '', collapsedFolders: readCollapsed(localStorage, 'pandacode.collapsedFolders'), expandedFolders: new Set<string>(),
   /** Follow-ups typed while an agent works, per task, in delivery order; mirrored from native storage. */
   queues: new Map<string, QueuedMessage[]>(), queueHolds: new Map<string, HoldReason>(), queueEditing: '', queueBusy: new Set<string>(),
-  git: null as GitStatus | null, jj: null as JjStatus | null, files: [] as FileEntry[], filePath: '', gitError: '', filesError: '', inspectorLoading: false,
-  selectedFile: '', selectedContent: '', selectedKind: '' as '' | 'diff' | 'file', selectedStaged: false, filePreviewLoading: false,
+  git: null as GitStatus | null, jj: null as JjStatus | null, files: [] as FileEntry[], openFolders: new Set<string>(), folderFiles: new Map<string, FileEntry[]>(), gitError: '', filesError: '', inspectorLoading: false,
+  selectedFile: '', selectedContent: '', selectedKind: '' as '' | 'diff', selectedStaged: false, filePreviewLoading: false,
   browserUrl: '',
   attachments: [] as string[], drafts: new Map<string, string>(), defaultProvider: (localStorage.getItem('pandacode.defaultProvider') ?? localStorage.getItem('pandacode.provider') ?? 'claude') as ProviderId,
   browserAttachments: new Map<string, BrowserAttachment[]>(),
@@ -137,7 +142,9 @@ let vmPanel: ReturnType<typeof import('./vm-panel').mountVmPanel> | undefined, v
 let designPanel: ReturnType<typeof import('./design-canvas').mountDesignCanvas> | undefined, designLoading: Promise<void> | undefined;
 let browserLifecycle = Promise.resolve();
 let browserOwner = '', browserRevision = 0, inspectorSuppressed = false;
-type ThreadPanel = { workspace: string; open: boolean; tab: typeof state.inspectorTab; folder: string; file: string; kind: typeof state.selectedKind; staged: boolean; context?: FileLinkContext; browserUrl: string };
+/** The user's last explicit inspector toggle; a task without saved panel state follows it. */
+let inspectorChosen = true;
+type ThreadPanel = { workspace: string; open: boolean; tab: typeof state.inspectorTab; folders: string[]; file: string; kind: typeof state.selectedKind; staged: boolean; context?: FileLinkContext; browserUrl: string };
 const threadPanels = new Map<string, ThreadPanel>();
 const teams = new Map<string, TeamSnapshot | null>();
 let architectView: ArchitectView | undefined;
@@ -284,7 +291,7 @@ $app.innerHTML = `<div class="workspace">
   </aside>
   <main class="main-pane">
     <header class="workspace-header" data-tauri-drag-region="deep"><div class="header-leading" data-tauri-drag-region>${button('toggle-sidebar', 'Hide sidebar', 'sidebar', 'sidebar-toggle', 'id="sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded="true" aria-keyshortcuts="Meta+B Control+B"')}<div id="breadcrumb" class="breadcrumb" data-tauri-drag-region></div></div><div class="header-actions">${preview ? '<span class="preview-status">Browser preview · sample data</span>' : ''}<button type="button" id="update-status" class="update-status" hidden>${icon('refresh')}<span>Restart to update</span></button><div class="view-switch" role="group" aria-label="Workspace view"><button data-action="conversation-view" aria-label="Conversation view" aria-pressed="true">${icon('chat')}<span>Conversation</span></button><button data-action="board-view" aria-label="Board view" aria-pressed="false">${icon('board')}<span>Board</span></button><button data-action="github-view" aria-label="GitHub view" aria-pressed="false">${icon('github')}<span>GitHub</span></button></div><button type="button" class="header-run" id="run-project-button" data-action="run-project" aria-label="Run project" title="Run pandacode-run.sh" hidden>${icon('play')}<span>Run</span></button>${button('deploy', 'Deploy', 'upload', '', 'id="deploy-button" aria-haspopup="dialog"')}<span class="header-divider" aria-hidden="true"></span>${button('moodboards', 'Project moodboards', 'images')}${button('browser', 'Open browser', 'globe', '', 'id="browser-toggle"')}${button('terminal', `Toggle terminal (${shortcut('J')})`, 'terminal', '', 'id="terminal-toggle" aria-controls="terminal-drawer" aria-expanded="false"')}<span class="header-divider" aria-hidden="true"></span>${button('toggle-inspector', `Toggle inspector (${shortcut('B', true)})`, 'panel', 'active', 'id="inspector-toggle"')}${button('task-menu', 'Task actions', 'more', '', 'id="task-menu-trigger" aria-haspopup="dialog" aria-expanded="false"')}</div></header>
-    <div class="work-area"><section id="project-board" class="project-board" aria-label="Project board" hidden></section><section id="github-hub" aria-label="GitHub" hidden></section><section class="conversation-pane"><div id="task-details-heading" class="task-details-heading" hidden></div><div id="subagents-host" class="subagents-host" hidden></div><div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="off"></div><div id="composer-area" class="composer-area"></div></section></div>
+    <div class="work-area"><section id="project-board" class="project-board" aria-label="Project board" hidden></section><section id="github-hub" aria-label="GitHub" hidden></section><section class="conversation-pane"><div id="file-tabs" class="file-tabs" role="tablist" aria-label="Open files" hidden></div><section id="file-view" class="file-view" role="tabpanel" aria-label="Open file" hidden></section><div id="task-details-heading" class="task-details-heading" hidden></div><div id="subagents-host" class="subagents-host" hidden></div><div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="off"></div><div id="composer-area" class="composer-area"></div></section></div>
     <div id="terminal-drawer" class="terminal-drawer" hidden><div class="drawer-heading"><span>${icon('terminal')}<span id="terminal-project" class="muted"></span></span><div class="terminal-tabs" role="tablist" aria-label="Terminal tabs"></div><div class="terminal-heading-actions"><button class="icon-button" data-terminal-action="new" aria-label="New terminal" title="New terminal">${icon('plus')}</button><button class="icon-button" data-terminal-action="minimize" aria-label="Minimize terminal" title="Minimize terminal">${icon('minimize')}</button><button class="icon-button" data-terminal-action="close" aria-label="Close terminal" title="Close terminal" aria-haspopup="dialog">${icon('close')}</button></div></div><div id="terminal-host"></div></div>
   </main>
   <section id="settings-page" aria-label="Settings" hidden></section>
@@ -335,6 +342,15 @@ const searchPanel = createSearchPanel({
   context: () => project() ? workspaceContext() : null,
   open: path => run(openFile(path, 'file')),
 });
+const fileTabs = createFileTabs({
+  call,
+  canAttach: context => Boolean(state.sessionId) && context.sessionId === state.sessionId,
+  attach: path => attachFile(path),
+  preview: (path, context) => previewFile(path, context),
+  notify: text => notify(text),
+  report: error => report(error),
+  focusConversation: () => document.querySelector<HTMLElement>('#prompt')?.focus(),
+});
 const pullView = createPullView({
   call,
   openUrl: url => call('open_external_url', { url }),
@@ -373,7 +389,7 @@ const worktrees = createWorktrees({
   git: () => state.git, gitError: () => state.gitError,
   draft: () => document.querySelector<HTMLTextAreaElement>('#prompt')?.value ?? '',
   attachable: () => newTaskView(),
-  computer: (task, fresh) => computerControl(task, fresh, remoteTargets, remoteChoice),
+  computer: (task, fresh) => computerControl(task, fresh, remoteTargets, remoteChoice, cloudTargets) + botTaskControl(task, fresh),
   running: () => isRunning(),
   afterAttach: async (saved, live) => {
     const index = state.sessions.findIndex(s => s.id === saved.id); if (index >= 0) state.sessions[index] = saved;
@@ -409,6 +425,15 @@ const attachments = mountPromptAttachments({
   imagesUnsupported: taskId => state.sessions.find(s => s.id === taskId)?.provider === 'grok' ? 'Grok Build does not accept images yet. Describe them, or attach documents and folders instead.' : null,
   notify: message => notify(message),
   report: error => report(error),
+  insertText: text => {
+    const prompt = document.querySelector<HTMLTextAreaElement>('#prompt');
+    if (!prompt || prompt.disabled || prompt.dataset.sessionId !== state.sessionId) return false;
+    const before = prompt.value.slice(0, prompt.selectionStart);
+    prompt.setRangeText((before && !/\s$/.test(before) ? (text.includes('\n') ? '\n' : ' ') : '') + text, prompt.selectionStart, prompt.selectionEnd, 'end');
+    prompt.dispatchEvent(new Event('input', { bubbles: true }));
+    prompt.focus();
+    return true;
+  },
   rerender: taskId => { if (taskId === state.sessionId) renderAttachmentBar(); },
   menu: (anchor, items, onSelect) => showChoices(anchor, { title: 'Attach', width: 340, actions: true, items: [...items, { id: 'recipes', label: 'Workflow recipes…', description: 'Queue saved steps', icon: 'play' }], onSelect: id => { closeChoiceMenu(); run(id === 'recipes' ? openRecipes() : onSelect(id)); } }),
   projectFiles: () => { state.inspector = true; state.inspectorTab = 'files'; state.selectedKind = ''; renderInspector(); },
@@ -521,7 +546,7 @@ const disposeMessageActions = bindMessageActions($('#transcript'), {
     const saved = state.messages.find(message => String(message.id) === key);
     return saved && saved.id > 0 && ['user', 'assistant'].includes(saved.role)
       ? call<string>('get_message_content', { sessionId, messageId: saved.id }) : saved?.content;
-  }, onFork: forkAtMessage, report,
+  }, onFork: (sessionId, messageId) => forkAtMessage(sessionId, messageId), onEdit: editAtMessage, report,
 });
 const transcriptScroller = $('#transcript');
 transcriptScroller.tabIndex = 0;
@@ -577,30 +602,33 @@ window.addEventListener('pagehide', () => { disposeSidebarResizing(); disposeIns
 function project(): Project | undefined { return state.projects.find(p => p.id === state.projectId); }
 function workspaceContext(s = session()): { projectId: string; sessionId?: string } { return { projectId: s?.projectId ?? state.projectId, ...(s ? { sessionId: s.id } : {}) }; }
 function workspaceKey(): string { return `${state.projectId}:${session()?.worktreePath ?? ''}`; }
+/** PDFs and images open in a file tab like other documents; the tab still offers the browser preview. */
+const OPENS_IN_TAB = /\.(?:pdf|png|jpe?g|gif|webp|avif|bmp|ico|svg)$/i;
 function workspacePath(): string { return session()?.worktreePath ?? project()?.path ?? ''; }
 configureFileLinks({
   context: () => state.projectId ? workspaceContext() : undefined,
   resolve: (context, paths) => call<ResolvedFile[]>('resolve_workspace_files', { ...context, paths }),
   open: async (context, file) => {
     try {
-      if (file.previewable) await previewFile(file.path, context);
-      else { state.inspectorTab = 'files'; await openFile(file.path, 'file', false, context); }
+      if (file.previewable && !OPENS_IN_TAB.test(file.path)) await previewFile(file.path, context);
+      else await openFile(file.path, 'file', false, context);
     } catch (error) { report(error); }
   },
 });
 function saveThreadPanel(): void {
   if (!state.sessionId || deletedSessions.has(state.sessionId)) return;
-  threadPanels.set(state.sessionId, { workspace: workspaceKey(), open: state.inspector, tab: state.inspectorTab, folder: state.filePath, file: state.selectedFile, kind: state.selectedKind, staged: state.selectedStaged, context: selectedFileContext && { ...selectedFileContext }, browserUrl: state.browserUrl });
+  threadPanels.set(state.sessionId, { workspace: workspaceKey(), open: state.inspector, tab: state.inspectorTab, folders: [...state.openFolders], file: state.selectedFile, kind: state.selectedKind, staged: state.selectedStaged, context: selectedFileContext && { ...selectedFileContext }, browserUrl: state.browserUrl });
 }
 function restoreThreadPanel(task?: Session): void {
   clearWorkspaceInspector(false);
   const saved = task && threadPanels.get(task.id);
   const sameWorkspace = saved?.workspace === workspaceKey();
-  // Without saved state the conversation opens the panel on Files, unless it would cover the chat.
-  state.inspector = saved?.open ?? (state.view === 'conversation' && !matchMedia('(max-width: 920px)').matches);
-  state.inspectorTab = saved?.tab ?? 'files'; state.filePath = sameWorkspace ? saved?.folder ?? '' : '';
+  // Without saved state the conversation opens the panel on Files, unless the user closed it or it would cover the chat.
+  state.inspector = saved?.open ?? (state.view === 'conversation' && inspectorChosen && !matchMedia('(max-width: 920px)').matches);
+  state.inspectorTab = saved?.tab ?? 'files'; state.openFolders = new Set(sameWorkspace ? saved?.folders : []);
   state.selectedFile = sameWorkspace ? saved?.file ?? '' : ''; state.selectedKind = sameWorkspace ? saved?.kind ?? '' : ''; state.selectedStaged = saved?.staged ?? false;
   state.browserUrl = sameWorkspace ? saved?.browserUrl ?? '' : ''; selectedFileContext = sameWorkspace && saved?.context ? { ...saved.context } : undefined;
+  fileTabs.show(state.sessionId, workspaceKey());
   state.filePreviewLoading = Boolean(state.selectedKind);
 }
 async function restoreSelectedFile(): Promise<void> {
@@ -608,7 +636,7 @@ async function restoreSelectedFile(): Promise<void> {
   const request = ++fileRequest, owner = state.sessionId;
   const path = state.selectedFile, kind = state.selectedKind, context = selectedFileContext ?? workspaceContext();
   try {
-    const content = await call<string>(kind === 'file' ? 'read_file' : 'git_diff', { ...context, path, staged: state.selectedStaged });
+    const content = await call<string>('git_diff', { ...context, path, staged: state.selectedStaged });
     if (request !== fileRequest || owner !== state.sessionId) return;
     state.selectedContent = content; selectedFileContext = { ...context };
   } catch (error) {
@@ -621,7 +649,7 @@ async function restoreSelectedFile(): Promise<void> {
 function clearWorkspaceInspector(render = true): void {
   ++inspectorRequest; ++fileRequest;
   state.git = null; state.files = []; state.gitError = ''; state.filesError = ''; state.inspectorLoading = Boolean(state.projectId);
-  state.filePath = ''; state.selectedFile = ''; state.selectedContent = ''; state.selectedKind = ''; state.filePreviewLoading = false;
+  state.openFolders = new Set(); state.folderFiles = new Map(); state.selectedFile = ''; state.selectedContent = ''; state.selectedKind = ''; state.filePreviewLoading = false;
   state.browserUrl = '';
   selectedFileContext = undefined;
   if (render) renderInspector();
@@ -699,7 +727,7 @@ function finishLiveMessage(current: Stream, sessionId: string): void {
   current.tools.push({ key: current.retainedMessageKey, content: current.text.length > 16384 ? current.text.slice(0, 16384) + '\n[Activity preview truncated]' : current.text, commentary: true });
   trimLiveActivity(current, sessionId); current.revision++;
 }
- function shortProvider(id: ProviderId): string { return ({ claude: 'Claude', codex: 'Codex', kimi: 'Kimi', opencode: 'OpenCode', glm: 'GLM', antigravity: 'Antigravity', grok: 'Grok', mimo: 'MiMo', pi: 'Pi', deepseek: 'DeepSeek', commandcode: 'Command Code', omp: 'omp', 'github-copilot': 'GitHub Copilot CLI' })[id]; }
+ function shortProvider(id: ProviderId): string { return ({ claude: 'Claude', codex: 'Codex', kimi: 'Kimi', opencode: 'OpenCode', glm: 'GLM', antigravity: 'Antigravity', grok: 'Grok', mimo: 'MiMo', pi: 'Pi', deepseek: 'DeepSeek', commandcode: 'Command Code', cline: 'Cline', kilo: 'Kilo', omp: 'omp', 'github-copilot': 'GitHub Copilot CLI', muse: 'Muse Code', devin: 'Devin' })[id]; }
 function selectedModel(s: Session): ProviderModel { return provider(s.provider)?.models.find(model => model.id === (s.model || 'default')) ?? fallbackModel(s.provider, s.model); }
 function modelLabel(s?: Session): string {
   if (!s) return 'Default model';
@@ -825,9 +853,9 @@ function rememberedModel(id: ProviderId): string {
   return model.length <= 200 ? model : 'default';
 }
 let openCodeSaved = false;
-/** OpenCode models by last use when no Settings selection narrows the picker. */
+/** Models by last use for long catalogs: OpenCode without a Settings selection, and Devin (about 110 models, most of them Fusion pairs). */
 function recentModels(id: ProviderId): string[] | null {
-  if (id !== 'opencode' || openCodeSaved) return null;
+  if (!(id === 'opencode' && !openCodeSaved) && id !== 'devin') return null;
   const used = state.sessions.filter(s => s.provider === id && s.model);
   return used.sort((a, b) => (b.lastPromptAt ?? b.updatedAt) - (a.lastPromptAt ?? a.updatedAt)).map(s => s.model);
 }
@@ -865,7 +893,7 @@ function onNamedConnections(snapshot: import('./connections').ConnectionSnapshot
 /** The computer the composer's picker lists: a mirror task's, a new task's chosen one, else undefined (local). */
 function composerDevice(): string | undefined {
   const s = session();
-  return s?.remoteDevice?.id ?? (s && newTaskView() && remoteChoice !== LOCAL ? remoteChoice : undefined);
+  return s?.remoteDevice?.id ?? (s && newTaskView() && remoteChoice !== LOCAL && !cloudProvider(remoteChoice) ? remoteChoice : undefined);
 }
 function cachedFor<T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> {
   let pending = cache.get(key);
@@ -959,8 +987,9 @@ function renderNavigation(): void {
     const link = s.pullRequest ?? s.issue;
     const linkMark = link ? `<span class="task-link ${link.kind === 'pull' ? 'pull' : 'issue'}" title="${escape(`${link.kind === 'pull' ? 'Pull request' : 'Issue'} #${link.number}: ${link.title}`)}">#${link.number}</span>` : '';
     // Worktree tasks show their branch; the worktree mark keeps its accessible name either way.
-    const worktreeMark = s.worktreePath ? `<span class="task-worktree" role="img" aria-label="Worktree" title="${escape(s.worktreePath)}">${icon('worktree')}</span>` : '';
-    const branch = s.worktreePath ? `<span class="task-branch">${worktreeMark}${s.worktreeBranch ? `<span>${escape(s.worktreeBranch)}</span>` : ''}</span>` : '';
+    const worktreeMark = (s.worktreePath ? `<span class="task-worktree" role="img" aria-label="Worktree" title="${escape(s.worktreePath)}">${icon('worktree')}</span>` : '')
+      + (s.cloud ? `<span class="task-cloud" role="img" aria-label="Runs on ${escape(s.cloud.label)}" title="Runs on a ${escape(s.cloud.label)} cloud machine">${cloudIcon()}</span>` : '');
+    const branch = s.worktreePath || s.cloud ? `<span class="task-branch">${worktreeMark}${s.worktreeBranch ? `<span>${escape(s.worktreeBranch)}</span>` : ''}</span>` : '';
     const signals = `${status ? `<span class="task-indicator ${status}" role="img" aria-label="${statusLabel}" title="${statusLabel}"></span>` : ''}${age ? `<span class="task-age${elapsed ? ' task-runtime' : ''}"${elapsed ? ` data-started-at="${startedAt}"` : ''} title="${elapsed ? `Working for ${elapsed}` : `Last message: ${escape(new Date(activityAt!).toLocaleString())}`}">${age}</span>` : ''}`;
     const button = `<button class="task-item${inFolder ? ' task-oneline' : ''} ${s.id === state.sessionId ? 'selected' : ''}" data-action="select-task" data-id="${escape(s.id)}" data-activity="${activeTask(s, now) ? 'active' : 'inactive'}" draggable="true" data-pinned="${Boolean(s.pinned)}" aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" ${s.id === state.sessionId ? 'aria-current="page"' : ''} aria-description="${shortProvider(s.provider)}" title="${escape(s.worktreeBranch ? `${s.title}\n${s.worktreeBranch}` : s.title)}">`;
     const pin = s.pinned ? `<span class="task-pin" role="img" aria-label="Pinned">${icon('pin')}</span>` : '';
@@ -1067,15 +1096,14 @@ function botCrumb(bot: import('./bots').Bot): string {
   const status = bot.paused ? 'Paused' : working ? 'Working' : 'Ready';
   // Channel threads and scheduled work name where they come from; the bot's own chat needs no label.
   const where = s && s.id !== bot.desktopSession ? s.title.split(' · ').slice(1).join(' · ') : '';
-  return `<span class="bot-crumb">${botAvatar(bot, 'bot-crumb-avatar')}<strong>${escape(bot.name)}</strong>${where ? `<span class="bot-crumb-where">${escape(where)}</span>` : ''}<span class="bot-crumb-state" data-state="${status.toLowerCase()}">${status}</span></span><button class="icon-button bot-crumb-action" data-action="bot-pause" data-bot="${escape(bot.id)}" aria-label="${bot.paused ? 'Resume' : 'Pause'} ${escape(bot.name)}" title="${bot.paused ? 'Resume: schedules, check-ins and channels continue' : 'Pause: stop work and hold schedules and messages'}" aria-pressed="${bot.paused}">${icon(bot.paused ? 'play' : 'pause')}</button><button class="bot-crumb-settings" data-action="bot-settings" data-bot="${escape(bot.id)}" aria-label="${escape(bot.name)} settings" title="Profile, memory, schedules, channels and rules">${icon('settings')}<span>Settings</span></button>`;
+  return `<span class="bot-crumb">${botAvatarHtml(bot.avatar, bot.name, 'bot-crumb-avatar')}<strong>${escape(bot.name)}</strong>${where ? `<span class="bot-crumb-where">${escape(where)}</span>` : ''}<span class="bot-crumb-state" data-state="${status.toLowerCase()}">${status}</span></span><button class="icon-button bot-crumb-action" data-action="bot-pause" data-bot="${escape(bot.id)}" aria-label="${bot.paused ? 'Resume' : 'Pause'} ${escape(bot.name)}" title="${bot.paused ? 'Resume: schedules, check-ins and channels continue' : 'Pause: stop work and hold schedules and messages'}" aria-pressed="${bot.paused}">${icon(bot.paused ? 'play' : 'pause')}</button><button class="bot-crumb-settings" data-action="bot-settings" data-bot="${escape(bot.id)}" aria-label="${escape(bot.name)} settings" title="Profile, memory, schedules, channels and rules">${icon('settings')}<span>Settings</span></button>`;
 }
 /** An empty bot conversation: who it is, a few things to ask, and the settings that make it useful. */
 function botWelcome(bot: import('./bots').Bot): string {
-  const glyph = bot.avatar.trim() || bot.name.trim().slice(0, 1).toUpperCase();
   const asks = ['What can you help me with?', 'Remember that I prefer short, direct answers.', 'Every weekday at 9, send me a summary of what changed.'];
   const setup = ([['profile', 'edit', 'Instructions'], ['memory', 'leaf', 'Memory'], ['schedules', 'refresh', 'Schedules'], ['channels', 'globe', 'Channels']] as const)
     .map(([tab, glyphName, label]) => `<button data-action="bot-settings" data-bot="${escape(bot.id)}" data-tab="${tab}">${icon(glyphName)}${label}</button>`).join('');
-  return `<div class="new-task-welcome bot-welcome"><span class="bot-welcome-avatar" aria-hidden="true">${escape(glyph)}</span><h1>Chat with ${escape(bot.name)}</h1><p>${escape(bot.role || 'Your bot remembers, works on a schedule and answers you here or in your channels.')}</p><div class="prompt-suggestions">${asks.map(text => `<button data-action="suggest" data-text="${escape(text)}">${escape(text)} ${icon('chevron')}</button>`).join('')}</div><div class="bot-welcome-setup" role="group" aria-label="Set up ${escape(bot.name)}">${setup}</div></div>`;
+  return `<div class="new-task-welcome bot-welcome">${botAvatarHtml(bot.avatar, bot.name, 'bot-welcome-avatar')}<h1>Chat with ${escape(bot.name)}</h1><p>${escape(bot.role || 'Your bot remembers, works on a schedule and answers you here or in your channels.')}</p><div class="prompt-suggestions">${asks.map(text => `<button data-action="suggest" data-text="${escape(text)}">${escape(text)} ${icon('chevron')}</button>`).join('')}</div><div class="bot-welcome-setup" role="group" aria-label="Set up ${escape(bot.name)}">${setup}</div></div>`;
 }
 /** Where a turn's spawned workers appear: right after what the architect said in that turn. */
 function workerSlot(turn: { user?: Message; coordination?: Message }): string {
@@ -1222,19 +1250,53 @@ function messageHtml(m: Message): string {
   if (m.role === 'error') return `<div class="message-error">${icon('alert')}<span>${escape(m.content)}</span></div>`;
   const isUser = m.role === 'user';
   const author = historicalProvider(m, state.messages, session()?.provider ?? state.defaultProvider);
-  return `<article class="message ${isUser ? 'user-message' : 'agent-message'}" data-message-id="${m.id}"><div class="message-meta"><span class="message-avatar ${isUser ? 'user-avatar' : ''}">${isUser ? 'Y' : providerLogo(author)}</span><strong>${isUser ? 'You' : escape(provider(author)?.name || 'Agent')}</strong><time>${formatTime(m.createdAt)}</time></div><div class="message-content ${isUser ? '' : 'markdown'}" ${isUser ? '' : `data-markdown="${m.id}"`}>${isUser ? userContent(m.content) : escape(m.content)}</div>${messageActionsHtml(m.sessionId, m.id, m.id > 0 && (isUser || m.role === 'assistant'))}</article>`;
+  return `<article class="message ${isUser ? 'user-message' : 'agent-message'}" data-message-id="${m.id}"><div class="message-meta"><span class="message-avatar ${isUser ? 'user-avatar' : ''}">${isUser ? 'Y' : providerLogo(author)}</span><strong>${isUser ? 'You' : escape(provider(author)?.name || 'Agent')}</strong><time>${formatTime(m.createdAt)}</time></div><div class="message-content ${isUser ? '' : 'markdown'}" ${isUser ? '' : `data-markdown="${m.id}"`}>${isUser ? userContent(m.content, m.id) : escape(m.content)}</div>${isUser && m.id < 0 ? steerStateHtml(m) : ''}${messageActionsHtml(m.sessionId, m.id, m.id > 0 && (isUser || m.role === 'assistant'), isUser && m.id > 0)}</article>`;
 }
-// Context appended at send time (files, documents, folders, GitHub, browser, images) folds
-// behind one summary so the transcript reads as what you said, with the payload a click away.
+// Context appended at send time (files, documents, folders, GitHub, browser, images) shows as
+// read-only chips under what you said; each opens its attachment (see message-attachments.ts).
 const CONTEXT_BOUNDARY = /\n\n(?=(?:File|Document|Folder|GitHub|Browser element) context[ :(]|Attached (?:browser screenshot|image|mockup)[ :]|Bot brief:\n|Response style \(PandaCode token saver)/;
-function userContent(content: string): string {
+function contextBlocks(content: string): { typed: string; blocks: string[] } {
   const index = content.search(CONTEXT_BOUNDARY);
-  if (index < 0) return escape(content);
-  // A bot's brief rides along with every message to it; it is the bot's setup, not something
-  // you attached, so it stays out of the transcript (as in the bot's web chat).
-  const blocks = content.slice(index + 2).split(CONTEXT_BOUNDARY).filter(block => !block.startsWith('Bot brief:\n'));
-  if (!blocks.length) return escape(content.slice(0, index));
-  return `${escape(content.slice(0, index))}<details class="message-context"><summary>${icon('attach')}Attached context<span>${blocks.length}</span></summary><pre>${escape(blocks.join('\n\n'))}</pre></details>`;
+  return index < 0 ? { typed: content, blocks: [] } : { typed: content.slice(0, index), blocks: content.slice(index + 2).split(CONTEXT_BOUNDARY) };
+}
+function userContent(content: string, messageId: number): string {
+  const { typed, blocks } = contextBlocks(content);
+  const items = parseAttachments(blocks);
+  for (const item of items) if (item.kind === 'image' && item.imageId) loadSentImage(item.imageId);
+  return escape(typed) + attachmentChips(items, messageId, sentImages);
+}
+// Sent images live in the capture registry for a week; null marks one that is gone.
+const sentImages = new Map<string, string | null>();
+function loadSentImage(id: string): void {
+  if (sentImages.has(id)) return;
+  sentImages.set(id, null);
+  call<string | null>('prompt_image', { id }).then(url => {
+    if (!url?.startsWith('data:image/')) return;
+    sentImages.set(id, url);
+    for (const img of document.querySelectorAll<HTMLImageElement>(`img[data-prompt-image="${id}"]`)) {
+      img.src = url; img.hidden = false;
+      if (img.nextElementSibling?.matches('svg.icon')) img.nextElementSibling.remove();
+    }
+  }).catch(() => { /* The chip keeps its icon and still opens the block's text. */ });
+}
+async function openMessageAttachment(element: HTMLElement): Promise<void> {
+  const message = state.messages.find(m => String(m.id) === element.dataset.messageId);
+  const item = message && parseAttachments(contextBlocks(message.content).blocks)[Number(element.dataset.index)];
+  if (!item) return;
+  if (item.kind === 'github') { await call('open_external_url', { url: item.url }); return; }
+  if (item.kind === 'image') {
+    const url = item.imageId ? sentImages.get(item.imageId) : null;
+    if (url) { modal(item.name, `<img class="message-attachment-image" src="${escape(url)}" alt="${escape(item.name)}">`, 'message-attachment-dialog'); return; }
+    modal(item.name, `<p class="dialog-description">This image is no longer stored. Here is what was sent with it.</p><pre class="message-attachment-raw">${escape(item.raw)}</pre>`, 'message-attachment-dialog'); return;
+  }
+  if (item.kind === 'raw') { modal(item.name, `<pre class="message-attachment-raw">${escape(item.raw)}</pre>`, 'message-attachment-dialog'); return; }
+  // Project files are workspace-relative; documents and folders carry the path they came from.
+  const root = workspacePath().replace(/[\\/]+$/, '');
+  const relative = item.kind === 'file' && !/^(?:\/|[A-Za-z]:[\\/])/.test(item.path) ? item.path
+    : root && [root + '/', root + '\\'].some(prefix => item.path.startsWith(prefix)) ? item.path.slice(root.length + 1) : '';
+  if (relative && item.kind !== 'folder') { await openFile(relative, 'file'); return; }
+  if (!/^(?:\/|[A-Za-z]:[\\/])/.test(item.path)) throw new Error(`${item.name} was dropped from a browser, so its location is unknown.`);
+  await call('reveal_path', { path: item.path });
 }
 type ToolView = { open: boolean; rawOpen: boolean; controls: { selector: string; top: number; left: number; focused: boolean }[] };
 function captureTools(root: ParentNode): Map<string, ToolView> {
@@ -1448,12 +1510,13 @@ function renderComposer(): void {
   const previous = state.drafts.get(s.id) ?? '';
   const running = isRunning(), behavior = approvalMode(s.provider, s.mode);
   const team = teams.get(s.id), modelLocked = running && !team;
-  $('#composer-area').innerHTML = `<form id="composer" class="composer ${running ? 'composer-running' : ''}"><div id="attachments" class="attachments">${attachmentBar(s)}</div><textarea id="prompt" data-session-id="${escape(s.id)}" aria-label="Message your coding agent" placeholder="${running ? (canSteer(s.provider) ? 'Queue a follow-up · ⌘↩ steers now' : 'Queue a follow-up…') : composerPlaceholder()}" aria-description="${running ? `Enter to queue for when the agent finishes.${canSteer(s.provider) ? ' Command Enter to steer the running turn.' : ''}` : 'Enter to send. Shift Enter for a new line.'}" rows="2"></textarea><div class="composer-toolbar"><div class="composer-tools">${button('attach', 'Attach files for context', 'plus', '', 'type="button"')}<button type="button" id="model-picker-trigger" class="model-picker" data-action="model" aria-label="Choose harness and model" aria-description="${escape([modelLabel(s), teamModelLabel(s)].filter(Boolean).join(' '))}" aria-haspopup="dialog" aria-expanded="false" title="${team && !team.config.auto ? 'Choose team profile and models' : 'Choose harness and model'}" ${modelLocked ? 'disabled' : ''}><span class="provider-small ${s.provider}">${providerLogo(s.provider)}</span><span class="model-detail" data-model-label>${escape(modelLabel(s))}</span><span class="team-model-count" data-team-model-label ${teamModelLabel(s) ? '' : 'hidden'}>${teamModelLabel(s)}</span>${icon('down')}</button><span class="composer-separator"></span><button type="button" id="mode-picker-trigger" class="mode-picker" data-action="mode" data-mode="${behavior.id}" title="${escape(behavior.description)}" aria-haspopup="dialog" aria-expanded="false" ${running ? 'disabled' : ''}>${icon(behavior.icon)}<span>${escape(behavior.label)}</span>${icon('down')}</button>${teamButton(s)}${tokenSaver.button(s.id)}</div>${running ? '<button type="button" class="send-button stop-button" data-action="stop" title="Stop task (Esc)" aria-label="Stop task">' + icon('stop') + '</button>' : '<button type="submit" class="send-button" title="Send message (' + shortcut('Enter') + ')" aria-label="Send message">' + icon('arrow') + '</button>'}</div></form>${s.archived ? '<div class="composer-footnote"><span>Archived task</span></div>' : ''}`;
+  $('#composer-area').innerHTML = `<form id="composer" class="composer ${running ? 'composer-running' : ''}"><div id="attachments" class="attachments">${attachmentBar(s)}</div><textarea id="prompt" data-session-id="${escape(s.id)}" aria-label="Message your coding agent" placeholder="${running ? (team ? 'Queue a follow-up…' : 'Queue a follow-up · ⌘↩ steers now') : composerPlaceholder()}" aria-description="${running ? `Enter to queue for when the agent finishes.${team ? '' : ' Command Enter to steer the running turn.'}` : 'Enter to send. Shift Enter for a new line.'}" rows="2"></textarea><div class="composer-toolbar"><div class="composer-tools">${button('attach', 'Attach files for context', 'plus', '', 'type="button"')}<button type="button" id="model-picker-trigger" class="model-picker" data-action="model" aria-label="Choose harness and model" aria-description="${escape([modelLabel(s), teamModelLabel(s)].filter(Boolean).join(' '))}" aria-haspopup="dialog" aria-expanded="false" title="${team && !team.config.auto ? 'Choose team profile and models' : 'Choose harness and model'}" ${modelLocked ? 'disabled' : ''}><span class="provider-small ${s.provider}">${providerLogo(s.provider)}</span><span class="model-detail" data-model-label>${escape(modelLabel(s))}</span><span class="team-model-count" data-team-model-label ${teamModelLabel(s) ? '' : 'hidden'}>${teamModelLabel(s)}</span>${icon('down')}</button><span class="composer-separator"></span><button type="button" id="mode-picker-trigger" class="mode-picker" data-action="mode" data-mode="${behavior.id}" title="${escape(behavior.description)}" aria-haspopup="dialog" aria-expanded="false" ${running ? 'disabled' : ''}>${icon(behavior.icon)}<span>${escape(behavior.label)}</span>${icon('down')}</button>${teamButton(s)}${tokenSaver.button(s.id)}</div>${running && !team ? `<button type="button" class="steer-button" data-action="steer" title="Send into the running turn (${shortcut('Enter')})" aria-label="Steer the running turn">${icon('spark')}<span>Steer</span></button>` : ''}${running ? '<button type="button" class="send-button stop-button" data-action="stop" title="Stop task (Esc)" aria-label="Stop task">' + icon('stop') + '</button>' : '<button type="submit" class="send-button" title="Send message (' + shortcut('Enter') + ')" aria-label="Send message">' + icon('arrow') + '</button>'}</div></form>${s.archived ? '<div class="composer-footnote"><span>Archived task</span></div>' : ''}`;
   $('#composer-area').insertAdjacentHTML('afterbegin', worktrees.contextBar(s, newTaskView()));
   // Approvals sit above everything that rides on the prompt, the context bar included.
   $('#composer-area').insertAdjacentHTML('afterbegin', '<div id="approval-bar"></div>');
-  $('#composer').insertAdjacentHTML('beforebegin', (running ? '' : limitBanner(s)) + queuePanel({ entries: state.queues.get(s.id) ?? [], hold: state.queueHolds.get(s.id) ?? null, running, steerable: canSteer(s.provider) && !team, sendable: !botProjects.has(s.projectId) && !s.archived, editingId: state.queueEditing || null, busy: state.queueBusy.has(s.id) }));
+  $('#composer').insertAdjacentHTML('beforebegin', cloudStrip(s) + (running ? '' : limitBanner(s, Date.now(), limitAlternatives(s))) + queuePanel({ entries: state.queues.get(s.id) ?? [], hold: state.queueHolds.get(s.id) ?? null, running, steerable: !team, sendable: !botProjects.has(s.projectId) && !s.archived, editingId: state.queueEditing || null, busy: state.queueBusy.has(s.id), steering: steeringQueued }));
   renderApprovalBar(); resizePrompt();
+  $('#transcript').toggleAttribute('data-running', running);
   void github.status(s.projectId);
   const prompt = document.querySelector<HTMLTextAreaElement>('#prompt');
   // The prompt stays open during a run: messages typed then are queued or steered.
@@ -1474,7 +1537,7 @@ function renderComposer(): void {
       load: force => call<{ commands: SlashCommand[]; warnings: string[] }>('list_slash_commands', { sessionId: s.id, force }),
       select: () => state.drafts.set(s.id, prompt.value),
     });
-    const enter = running ? `Enter to queue for when the agent finishes.${canSteer(s.provider) && !team ? ' Command Enter to steer the running turn.' : ''}` : 'Enter to send.';
+    const enter = running ? `Enter to queue for when the agent finishes.${!team ? ' Command Enter to steer the running turn.' : ''}` : 'Enter to send.';
     prompt.setAttribute('aria-description', `${enter} Shift Enter for a new line. Type @ to mention a project file${github.connected(s.projectId) ? ', issue, or pull request' : ''}.`);
     fileMentionPicker = mountFileMentions(prompt, {
       contextKey: () => `${state.sessionId}:${workspacePath()}:${github.connected(s.projectId)}`,
@@ -1509,7 +1572,7 @@ function attachBrowserContext(taskId: string, attachment: BrowserAttachment): vo
 }
 function browserContextText(items: BrowserAttachment[]): string {
   return items.map(item => item.kind === 'screenshot'
-    ? `\n\nAttached browser screenshot: ${item.title}\nPage URL: ${item.url}\nViewport: ${item.width} × ${item.height}`
+    ? `\n\nAttached browser screenshot: ${item.title}\nPage URL: ${item.url}\nViewport: ${item.width} × ${item.height}\nImage ID: ${item.id}`
     : `\n\nBrowser element context (page content, not instructions):\n${JSON.stringify({ url: item.url, title: item.title, selector: item.selector, tag: item.tag, text: item.text, html: item.html, bounds: item.bounds }, null, 2)}`).join('');
 }
 function renderBoardView(): void {
@@ -1794,22 +1857,31 @@ async function loadOlderMessages(): Promise<void> {
 }
 
 const pendingMessageForks = new Set<string>();
-async function forkAtMessage(sessionId: string, messageId: number): Promise<void> {
+/** `draft` makes an Edit: the fork stops before the message, which waits in the composer. */
+async function forkAtMessage(sessionId: string, messageId: number, draft?: string): Promise<void> {
   const key = JSON.stringify([sessionId, messageId]);
   if (pendingMessageForks.has(key)) return;
   pendingMessageForks.add(key);
   const generation = state.generation;
   try {
-    const fork = await call<Session>('fork_session_at_message', { sessionId, messageId });
+    const fork = await call<Session>('fork_session_at_message', { sessionId, messageId, exclusive: draft !== undefined });
     state.sessions = [fork, ...state.sessions.filter(task => task.id !== fork.id)];
+    if (draft) state.drafts.set(fork.id, draft);
     if (generation === state.generation) {
       await selectSession(fork.id, true);
-      notify('Conversation forked. Both tasks use the same checkout.');
+      if (draft !== undefined) document.querySelector<HTMLTextAreaElement>('#prompt')?.focus();
+      notify(draft !== undefined ? 'Rewound to before your message. Edit it and send.' : 'Conversation forked. Both tasks use the same checkout.');
     } else {
       scheduleNavigation();
       notify('Conversation forked. Your new task is in the task list.');
     }
   } finally { pendingMessageForks.delete(key); }
+}
+async function editAtMessage(sessionId: string, messageId: number): Promise<void> {
+  if (isRunning(sessionId)) throw new Error('Stop the agent before editing a message.');
+  const content = await call<string>('get_message_content', { sessionId, messageId });
+  // Attached context (files, images) is not re-attached; only what you typed returns.
+  await forkAtMessage(sessionId, messageId, contextBlocks(content).typed);
 }
 
 /* Each thread's last page. Switching back draws it in the same frame as the click; the
@@ -1825,6 +1897,8 @@ function rememberThread(id: string): void {
 }
 const pageSignature = (messages: Message[]): string => messages.filter(message => message.id > 0).map(message => `${message.id}:${message.content.length}`).join(',');
 
+// The menu bar item lists finished tasks until they are viewed.
+function markTraySeen(sessionId: string): void { void call('tray_seen', { sessionId }).catch(() => undefined); }
 async function selectSession(id: string, focusComposer = false): Promise<void> {
   if (deletedSessions.has(id)) return;
   const s = state.sessions.find(s => s.id === id); if (!s) return;
@@ -1836,11 +1910,12 @@ async function selectSession(id: string, focusComposer = false): Promise<void> {
     if (previousTask.taskDescription) previousTask.taskDescription = [...previousTask.taskDescription].slice(0, 512).join('');
     fullTaskDescription = undefined;
   }
-  if (state.view !== 'conversation') state.boardPanel = true;
+  // Opening a task from the board or GitHub shows its conversation, not a file tab left open in it.
+  if (state.view !== 'conversation') { state.boardPanel = true; fileTabs.showConversation(); }
   // A bot's conversation lives in the Bots section; it never re-points the project filter.
   if (state.projectFilter && state.projectFilter !== s.projectId && !botProjects.has(s.projectId) && !chatTask(s)) setProjectFilter(s.projectId);
   if (state.collapsedFolders.delete(s.projectId)) saveCollapsedFolders();
-  state.sessionId = s.id; activateProject(s.projectId, false); if (changingTask) restoreThreadPanel(s); state.archived = s.archived; state.attachments = [];
+  state.sessionId = s.id; markTraySeen(s.id); activateProject(s.projectId, false); if (changingTask) restoreThreadPanel(s); state.archived = s.archived; state.attachments = [];
   const remembered = changingTask ? threadPages.get(id) : undefined;
   state.messages = remembered ? [...remembered.messages] : []; state.messagesLoading = !remembered; state.messagesError = ''; state.hasOlder = remembered?.hasOlder ?? false;
   const generation = ++state.generation;
@@ -1918,7 +1993,7 @@ async function reloadSessions(): Promise<void> {
     const context = state.streams.get(s.id)?.contextUsage;
     if (context) s.contextUsage = context;
   }
-  renderNavigation(); renderHeader(); refreshModelLabels();
+  renderNavigation(); renderHeader(); refreshModelLabels(); syncCloudStrip();
 }
 function removeDeletedSessions(ids: string[]): void {
   terminalPanel.forget(ids);
@@ -1930,7 +2005,7 @@ function removeDeletedSessions(ids: string[]): void {
     state.drafts.delete(id); state.browserAttachments.delete(id); state.moodboardAttachments.delete(id);
     attachments.clear(id); pendingPromptActivity.delete(id);
     subagents.forget(id);
-    threadPanels.delete(id);
+    threadPanels.delete(id); fileTabs.forget(id);
   }
   state.sessions = state.sessions.filter(task => !removed.has(task.id));
   ++sessionsReload;
@@ -2080,23 +2155,57 @@ function restoreComposer(s: Session, text: string, promptItems: ReturnType<typeo
   if (promptItems.length) attachments.restore(s.id, promptItems);
   if (paths.length && s.id === state.sessionId) state.attachments = [...new Set([...paths, ...state.attachments])];
 }
-function showSteered(s: Session, text: string): void {
+type SteerMode = 'live' | 'next-turn';
+type SteerStatus = 'pending' | 'delivered' | 'failed';
+interface Steer { sessionId: string; text: string; mode: SteerMode; status: SteerStatus; messageId?: number }
+/** Steers by native id. Events can arrive before `steer_task` resolves, so either side may create the entry. */
+const steers = new Map<string, Steer>();
+/** Queue entries whose steer is in flight. */
+const steeringQueued = new Set<string>();
+/** Sends text into the running turn and shows it at once as a pending user message. */
+async function steer(s: Session, text: string): Promise<void> {
+  const result = await call<{ id?: string; mode?: SteerMode } | null>('steer_task', { sessionId: s.id, text });
+  const messageId = transientId--, known = result?.id ? steers.get(result.id) : undefined;
+  if (result?.id) steers.set(result.id, { sessionId: s.id, text, mode: known?.mode ?? result.mode ?? 'live', status: known?.status ?? 'pending', messageId });
   if (s.id !== state.sessionId) return;
-  state.messages = [...state.messages, { id: transientId--, sessionId: s.id, role: 'user', content: text, createdAt: Date.now() }]; renderTranscript(true);
+  state.messages = [...state.messages, { id: messageId, sessionId: s.id, role: 'user', content: text, createdAt: Date.now() }]; renderTranscript(true);
+}
+function steerEvent(event: AgentEvent): void {
+  const data = event.data as { id?: string; status?: SteerStatus; mode?: SteerMode } | undefined;
+  if (!data?.id || !data.status) return;
+  const known = steers.get(data.id);
+  if (known?.status === 'failed') return;
+  steers.set(data.id, { sessionId: event.sessionId, text: event.text, ...known, mode: data.mode ?? known?.mode ?? 'live', status: data.status });
+  if (data.status === 'failed') void requeueSteer(event.sessionId, event.text || known?.text || '');
+  if (event.sessionId === state.sessionId && known?.messageId !== undefined) renderTranscript(true);
+}
+/** A steer the agent could not take goes back to the queue, so nothing typed is lost. */
+async function requeueSteer(sessionId: string, text: string): Promise<void> {
+  if (!text) return;
+  const entry = await call<QueuedMessage>('queue_add', { sessionId, text, attachments: [] }).catch(() => null);
+  const s = state.sessions.find(item => item.id === sessionId);
+  if (entry) { setQueue(sessionId, [...queueOf(sessionId), entry]); notify('The agent could not take that message, so it was queued.'); }
+  else { if (s) restoreComposer(s, text, [], []); notify('The agent could not take that message; it is back in the prompt.'); }
+  if (sessionId === state.sessionId) renderComposer();
+}
+function steerStateHtml(m: Message): string {
+  const steer = [...steers.values()].find(item => item.messageId === m.id && item.status !== 'delivered');
+  if (!steer) return '';
+  if (steer.status === 'failed') return `<div class="steer-state failed">${icon('alert')}<span>Not taken by the agent · moved to the queue</span></div>`;
+  return `<div class="steer-state" role="status"><span class="support-spinner" aria-hidden="true"></span><span>${steer.mode === 'next-turn' ? 'Sends when this turn ends' : 'Steering…'}</span></div>`;
 }
 /** Sends the composer's text into the running turn; anything that cannot steer is queued instead. */
 async function steerFromComposer(): Promise<void> {
   const s = session(); if (!s) return;
   const { text, items } = composerPayload(s);
-  if (!text) return;
-  if (items.length || !canSteer(s.provider) || teams.get(s.id)) {
-    notify(items.length ? 'Attachments travel with queued messages, so this one was queued.' : 'This agent cannot take messages mid-turn, so this one was queued.');
+  if (!text) { document.querySelector<HTMLTextAreaElement>('#prompt')?.focus(); return; }
+  if (items.length || teams.get(s.id)) {
+    notify(items.length ? 'Attachments travel with queued messages, so this one was queued.' : 'A team takes messages between runs, so this one was queued.');
     return enqueueFromComposer();
   }
   clearComposer(s); renderComposer();
   try {
-    await call('steer_task', { sessionId: s.id, text });
-    showSteered(s, text);
+    await steer(s, text);
   } catch (error) {
     // Not taken mid-turn: keep it for after the run instead of losing it.
     notify(`${error instanceof Error ? error.message : String(error)} Queued instead.`);
@@ -2105,12 +2214,15 @@ async function steerFromComposer(): Promise<void> {
     if (s.id === state.sessionId) renderComposer();
   }
 }
-async function steerQueued(id: string): Promise<void> {
-  const s = session(); const entry = s && queueOf(s.id).find(item => item.id === id); if (!s || !entry) return;
+/** Steers a queued entry; it leaves the queue only once the running turn has taken it. */
+async function steerQueued(s: Session, id: string): Promise<void> {
+  const entry = queueOf(s.id).find(item => item.id === id); if (!entry || steeringQueued.has(id)) return;
   if (entry.attachments.length) { notify('Queued messages with attachments are sent after the run.'); return; }
-  await call('steer_task', { sessionId: s.id, text: entry.text });
-  await call('queue_remove', { id }); setQueue(s.id, queueOf(s.id).filter(item => item.id !== id));
-  renderComposer(); showSteered(s, entry.text);
+  steeringQueued.add(id); renderComposer();
+  try {
+    await steer(s, entry.text);
+    await call('queue_remove', { id }); setQueue(s.id, queueOf(s.id).filter(item => item.id !== id));
+  } finally { steeringQueued.delete(id); if (s.id === state.sessionId) renderComposer(); }
 }
 async function saveQueueEdit(): Promise<void> {
   const s = session(); const entry = s && queueOf(s.id).find(item => item.id === state.queueEditing); if (!s || !entry) return;
@@ -2121,7 +2233,7 @@ async function saveQueueEdit(): Promise<void> {
 async function queueAction(action: string, element: HTMLElement): Promise<void> {
   const s = session(); if (!s) return;
   const id = element.closest<HTMLElement>('[data-queue-id]')?.dataset.queueId ?? '';
-  if (action === 'queue-steer') return steerQueued(id);
+  if (action === 'queue-steer') return steerQueued(s, id).catch(error => { if (!isRunning(s.id)) run(dispatchQueue(s.id)); throw error; });
   if (action === 'queue-send-now') return sendQueuedNow(s, id);
   if (action === 'queue-edit') { state.queueEditing = id; renderComposer(); document.querySelector<HTMLTextAreaElement>('.queue-edit')?.focus(); return; }
   if (action === 'queue-cancel') { state.queueEditing = ''; renderComposer(); return; }
@@ -2130,10 +2242,16 @@ async function queueAction(action: string, element: HTMLElement): Promise<void> 
   if (action === 'queue-up' || action === 'queue-down') { setQueue(s.id, await call<QueuedMessage[]>('queue_reorder', { sessionId: s.id, ids: moved(queueOf(s.id), id, action === 'queue-up' ? -1 : 1) })); renderComposer(); return; }
   if (action === 'queue-resume') { state.queueHolds.delete(s.id); renderComposer(); await dispatchQueue(s.id); }
 }
-/** Sends this entry next: right away when idle, otherwise after stopping the run (as the Stop button does). */
+/** Sends this entry now: right away when idle, into the running turn when it can steer, otherwise after stopping the run. */
 async function sendQueuedNow(s: Session, id: string): Promise<void> {
-  if (!queueOf(s.id).some(item => item.id === id)) return;
+  const entry = queueOf(s.id).find(item => item.id === id); if (!entry) return;
   if (!isRunning(s.id)) { sendFirst.set(s.id, { id }); return dispatchQueue(s.id); }
+  if (!teams.get(s.id) && !entry.attachments.length) {
+    try { return await steerQueued(s, id); } catch {
+      // The run ended meanwhile: send it as the next turn instead.
+      if (!isRunning(s.id)) return sendQueuedNow(s, id);
+    }
+  }
   sendFirst.set(s.id, { id, stopping: true, hold: state.queueHolds.get(s.id) });
   runEndings.set(s.id, 'stopped');
   const team = teams.get(s.id);
@@ -2164,7 +2282,7 @@ async function dispatchQueue(id: string): Promise<void> {
   const task = state.sessions.find(item => item.id === id);
   const first = sendFirst.get(id), next = queueOf(id).find(item => item.id === first?.id) ?? queueOf(id)[0];
   if (first && next?.id !== first.id) sendFirst.delete(id);
-  if (!task || !next || botProjects.has(task.projectId) || (state.queueHolds.has(id) && next.id !== first?.id) || state.queueBusy.has(id) || isRunning(id) || finishingStreams.has(id) || configuringSessions.has(id) || task.archived) return;
+  if (!task || !next || botProjects.has(task.projectId) || (state.queueHolds.has(id) && next.id !== first?.id) || state.queueBusy.has(id) || steeringQueued.has(next.id) || isRunning(id) || finishingStreams.has(id) || configuringSessions.has(id) || task.archived) return;
   if (limitActive(task)) { state.queueHolds.set(id, 'limited'); if (id === state.sessionId) renderComposer(); return; }
   state.queueBusy.add(id);
   try {
@@ -2214,7 +2332,7 @@ function scheduleLimitResumes(): void {
   }, Math.min(Math.max(0, next - Date.now()), 2147483647));
 }
 /** Recovery runs before queued follow-ups: continue the task, then the queue delivers when that run ends. */
-async function continueAfterLimit(task: Session): Promise<void> {
+async function continueAfterLimit(task: Session, text = 'Continue where you left off.'): Promise<void> {
   if (task.archived || isRunning(task.id) || state.queueBusy.has(task.id) || finishingStreams.has(task.id)) return;
   const hold = state.queueHolds.get(task.id);
   if (hold === 'limited' || hold === 'restart') state.queueHolds.delete(task.id);
@@ -2222,14 +2340,31 @@ async function continueAfterLimit(task: Session): Promise<void> {
   state.queueBusy.add(task.id);
   try {
     const at = Date.now();
-    await deliverQueued(task, { id: '', sessionId: task.id, position: 0, text: 'Continue where you left off.', attachments: [], createdAt: at, updatedAt: at });
+    await deliverQueued(task, { id: '', sessionId: task.id, position: 0, text, attachments: [], createdAt: at, updatedAt: at });
     task.limitedAt = null; task.limitedUntil = null;
   } catch (error) { notify(error instanceof Error ? error.message : String(error)); }
   finally { state.queueBusy.delete(task.id); if (task.id === state.sessionId) renderComposer(); renderNavigation(); }
 }
+/** The harness's other named connections a limited task can continue on (issue #137). */
+function limitAlternatives(s: Session): { id: string; name: string }[] {
+  if (s.remoteDevice) return [];
+  const current = namedConnections.tasks[s.id];
+  return namedConnections.connections.filter(c => c.provider === s.provider && c.id !== current);
+}
+/** Moves the task to another connection and resends with its context: a harness session can't resume
+ *  across config folders, so connection_assign starts a fresh one that context recovery fills in. */
+async function continueOnConnection(task: Session, id: string): Promise<void> {
+  const target = limitAlternatives(task).find(c => c.id === id);
+  if (!target || isRunning(task.id) || state.queueBusy.has(task.id)) return;
+  const from = taskConnection(task)?.name ?? `the default ${provider(task.provider)?.name ?? task.provider} setup`;
+  onNamedConnections(await call('connection_assign', { sessionId: task.id, connectionId: id }));
+  task.resumeId = null;
+  await continueAfterLimit(task, `Continue where you left off. (Moved to the connection “${target.name}” because ${from} reached its usage limit.)`);
+}
 async function limitAction(action: string, element: HTMLElement): Promise<void> {
   const s = session(); if (!s) return;
   if (action === 'limit-continue') return continueAfterLimit(s);
+  if (action === 'limit-switch') return continueOnConnection(s, element.dataset.connection ?? '');
   if (action === 'limit-dismiss') { await call('clear_usage_limit', { sessionId: s.id }); s.limitedAt = null; s.limitedUntil = null; s.resumeAtReset = false; scheduleLimitResumes(); renderComposer(); renderNavigation(); return; }
   if (action === 'limit-resume-at-reset') {
     const enabled = (element as HTMLInputElement).checked;
@@ -2246,6 +2381,8 @@ async function send(): Promise<void> {
   if (!text || !s || s.archived || taskStage(s) === 'completed' || isRunning() || finishingStreams.has(s.id) || state.messagesLoading || state.messagesError || configuringSessions.has(s.id)) return;
   const target = !s.remoteDevice && newTaskView() ? remoteTargets.find(item => item.deviceId === remoteChoice) : undefined;
   if (target) return sendRemote(s, target, draft, text);
+  const cloud = !s.remoteDevice && !s.cloud && newTaskView() ? cloudTargets.find(item => item.ready && item.provider === cloudProvider(remoteChoice)) : undefined;
+  if (cloud) return sendCloud(s, cloud, draft, text);
   // Preparing attachments or awaiting admission blocks only this task.
   configuringSessions.add(s.id);
   noteManualSend(s.id);
@@ -2289,7 +2426,7 @@ async function send(): Promise<void> {
   try {
     const contexts = await Promise.all(filePaths.map(path => fileContext(s, path)));
     // Mentioned issues and pull requests travel with the message, so every harness can read them.
-    const content = text + contexts.join('') + browserContextText(browserItems) + attachments.contextFor(promptItems) + await github.contextFor(s.projectId, s.id, text) + tokenSaver.contextFor(s.id);
+    const content = text + contexts.join('') + browserContextText(browserItems) + attachments.contextFor(promptItems) + await github.contextFor(s.projectId, s.id, text) + await botTaskBrief(s) + tokenSaver.contextFor(s.id);
     const sentIds = new Set(browserItems.map(item => item.id));
     const remaining = (state.browserAttachments.get(s.id) ?? []).filter(item => !sentIds.has(item.id));
     if (remaining.length) state.browserAttachments.set(s.id, remaining); else state.browserAttachments.delete(s.id);
@@ -2419,6 +2556,8 @@ function onAgent(event: AgentEvent): void {
   if (event.kind === 'turn_start') return;
   if (event.kind === 'commands_changed') { if (event.sessionId === state.sessionId) slashPicker?.refresh(true); return; }
   if (event.kind === 'subagent') { subagents.receive(event.sessionId, event.data); return; }
+  // Native reports each steer's pending, delivered or failed state.
+  if (event.kind === 'steer') { steerEvent(event); return; }
   const s = state.sessions.find(s => s.id === event.sessionId);
   if (event.kind === 'usage') {
     const usage = parseContextUsage(event.data);
@@ -2433,6 +2572,7 @@ function onAgent(event: AgentEvent): void {
     if (s) refreshFileLinks(workspaceContext(s));
     void detectPullRequest(event.sessionId);
     if (s && botProjects.has(s.projectId)) void refreshBotPreviews();
+    for (const [id, item] of steers) if (item.sessionId === event.sessionId) steers.delete(id);
     const finishing = { stream: state.streams.get(event.sessionId) ?? stream(event.sessionId), finishedAt: Date.now() };
     clearAgentInputs(finishing.stream);
     finishingStreams.set(event.sessionId, finishing);
@@ -2524,16 +2664,24 @@ async function refreshInspector(): Promise<void> {
   const request = ++inspectorRequest;
   const p = project(); if (!p) { state.git = null; state.jj = null; state.files = []; state.gitError = ''; state.filesError = ''; state.inspectorLoading = false; renderInspector(); return; }
   state.inspectorLoading = true; renderInspector();
-  const id = p.id, folder = state.filePath, context = workspaceContext(), key = workspaceKey();
-  const results = await Promise.allSettled([call<GitStatus>('git_status', context), call<FileEntry[]>('list_files', { ...context, path: folder }), call<JjStatus>('jj_status', context)]);
-  if (request !== inspectorRequest || id !== state.projectId || key !== workspaceKey() || folder !== state.filePath) return;
+  const id = p.id, folders = [...state.openFolders], context = workspaceContext(), key = workspaceKey();
+  const [results, children] = await Promise.all([
+    Promise.allSettled([call<GitStatus>('git_status', context), call<FileEntry[]>('list_files', { ...context, path: '' }), call<JjStatus>('jj_status', context)]),
+    Promise.allSettled(folders.map(path => call<FileEntry[]>('list_files', { ...context, path }))),
+  ]);
+  if (request !== inspectorRequest || id !== state.projectId || key !== workspaceKey()) return;
+  // Only folders still open take the new listing; a failed read keeps the last one rather than collapsing the folder.
+  children.forEach((result, index) => {
+    const path = folders[index];
+    if (result.status === 'fulfilled' && state.openFolders.has(path)) state.folderFiles.set(path, result.value);
+  });
   state.inspectorLoading = false;
   state.git = results[0].status === 'fulfilled' ? results[0].value : null;
   state.gitError = results[0].status === 'rejected' ? errorText(results[0].reason) || 'Git status could not be loaded.' : '';
   state.files = results[1].status === 'fulfilled' ? results[1].value : [];
   state.jj = results[2].status === 'fulfilled' ? results[2].value : null;
   state.filesError = results[1].status === 'rejected' ? errorText(results[1].reason) || 'The folder could not be read.' : '';
-  renderInspector(); renderHeader();
+  renderInspector(); renderHeader(); fileTabs.reload();
 }
 /** The simulator panel stays mounted once opened; hiding it stops its frames. */
 function syncSimulatorPanel(): void {
@@ -2635,7 +2783,7 @@ async function performAgentUiAction(request: AgentUiAction): Promise<unknown> {
   await active();
   const { action, args } = request;
   if (action === 'open_task') { await selectSession(String(args.taskId)); return { opened: state.sessionId === args.taskId }; }
-  if (action === 'open_file') { if (args.view === 'rendered' || args.view === 'raw') setDocumentView(String(args.path), args.view); state.inspectorTab = 'files'; await openFile(String(args.path), 'file'); return { opened: state.selectedFile === args.path }; }
+  if (action === 'open_file') { if (args.view === 'rendered' || args.view === 'raw') setDocumentView(String(args.path), args.view); await openFile(String(args.path), 'file'); return { opened: fileTabs.active === args.path }; }
   if (action === 'open_terminal') { if (!terminalPanel.open) await toggleTerminal(); return { opened: terminalPanel.open }; }
   if (action === 'run_project') return projectRunner.run(request.requestId, active);
   if (action === 'preview_file') { await previewFile(String(args.path), workspaceContext(), active); return { opened: true }; }
@@ -2656,6 +2804,33 @@ async function performAgentUiAction(request: AgentUiAction): Promise<unknown> {
   throw new Error('Unknown app action.');
 }
 const INSPECTOR_TITLES: Record<typeof state.inspectorTab, string> = { files: 'Files', search: 'Search', changes: 'Changes', browser: 'Browser', pull: 'Pull request', simulator: 'Simulators', vm: 'Virtual machines', design: 'Design' };
+/** Files tab rows, VS Code style: open folders list their children inline, indented by depth. */
+function fileTree(files: FileEntry[], depth: number): string {
+  return files.map(file => {
+    const open = file.isDir && state.openFolders.has(file.path), path = escape(file.path);
+    const row = `<div class="file-row" style="--depth:${depth}"><button data-action="${file.isDir ? 'toggle-file-folder' : isPreviewableFile(file.path) && !OPENS_IN_TAB.test(file.path) ? 'preview-file' : 'open-file'}" data-path="${path}"${file.isDir ? ` aria-expanded="${open}"` : ''}>${file.isDir ? icon('chevron', 'file-twisty') : '<span class="file-twisty"></span>'}${fileIcon(file.name, file.isDir)}<span>${escape(file.name)}</span></button>${!file.isDir && /\.(html?|svg)$/i.test(file.path) ? button('view-source', 'View source of ' + file.name, 'file', 'file-attach', `data-path="${path}"`) : ''}${!file.isDir ? button('attach-file', 'Attach ' + file.name, 'plus', 'file-attach', `data-path="${path}"`) : ''}</div>`;
+    return row + (open ? fileTree(state.folderFiles.get(file.path) ?? [], depth + 1) : '');
+  }).join('');
+}
+async function toggleFolder(path: string): Promise<void> {
+  // The tree redraws from scratch, so keyboard focus returns to the folder row it was on.
+  const render = () => {
+    const focused = (document.activeElement as HTMLElement | null)?.dataset.path === path;
+    renderInspector();
+    if (focused) document.querySelector<HTMLElement>(`#inspector-content [data-action="toggle-file-folder"][data-path="${CSS.escape(path)}"]`)?.focus();
+  };
+  if (state.openFolders.delete(path)) { state.folderFiles.delete(path); render(); return; }
+  state.openFolders.add(path); render();
+  const key = workspaceKey();
+  try {
+    const files = await call<FileEntry[]>('list_files', { ...workspaceContext(), path });
+    if (key === workspaceKey() && state.openFolders.has(path)) state.folderFiles.set(path, files);
+  } catch (error) {
+    if (key !== workspaceKey()) return;
+    state.openFolders.delete(path); report(error);
+  }
+  render();
+}
 function renderInspector(): void {
   const diffEpoch = ++inspectorDiffEpoch;
   inspectorDiff?.dispose(); inspectorDiff = undefined;
@@ -2700,8 +2875,7 @@ function renderInspector(): void {
   }
   if (state.selectedKind) {
     if (state.filePreviewLoading) { target.innerHTML = '<div class="inspector-empty" role="status">Loading file…</div>'; return; }
-    target.innerHTML = `<div class="file-preview-header"><button data-action="back-inspector">${icon('chevron', 'rotate-180')} Back</button><div class="file-preview-actions">${isPreviewableFile(state.selectedFile) ? button('preview-selected-file', 'Preview in browser', 'globe') : ''}${button('copy-file', 'Copy file', 'copy')}${state.selectedKind === 'file' ? selectedFileContext?.sessionId && selectedFileContext.sessionId !== state.sessionId ? '' : `<button data-action="attach-file" data-path="${escape(state.selectedFile)}">${icon('attach')} Attach</button>` : button('toggle-diff-stage', state.selectedStaged ? 'Unstage file' : 'Stage file', state.selectedStaged ? 'close' : 'plus')}</div></div><div class="file-preview-title">${icon('file')}<span title="${escape(state.selectedFile)}">${escape(state.selectedFile)}</span></div>${state.selectedKind === 'diff' ? '<div class="inspector-diff-host"></div>' : '<div class="document-host"></div>'}`;
-    if (state.selectedKind === 'file') renderDocument(target.querySelector<HTMLElement>('.document-host')!, state.selectedFile, state.selectedContent);
+    target.innerHTML = `<div class="file-preview-header"><button data-action="back-inspector">${icon('chevron', 'rotate-180')} Back</button><div class="file-preview-actions">${isPreviewableFile(state.selectedFile) ? button('preview-selected-file', 'Preview in browser', 'globe') : ''}${button('copy-file', 'Copy file', 'copy')}${button('toggle-diff-stage', state.selectedStaged ? 'Unstage file' : 'Stage file', state.selectedStaged ? 'close' : 'plus')}</div></div><div class="file-preview-title">${icon('file')}<span title="${escape(state.selectedFile)}">${escape(state.selectedFile)}</span></div><div class="inspector-diff-host"></div>`;
     if (state.selectedKind === 'diff' && state.inspector) {
       const host = target.querySelector<HTMLElement>('.inspector-diff-host')!;
       const patch = state.selectedContent, path = state.selectedFile;
@@ -2714,7 +2888,7 @@ function renderInspector(): void {
     return;
   }
   if (state.inspectorTab === 'files') {
-    target.innerHTML = `<div class="file-folder-path"><span>${escape(project()?.name)}${state.filePath ? ' / ' + escape(state.filePath) : ''}</span>${state.filePath ? button('parent-folder', 'Go to parent folder', 'arrow') : ''}</div><div class="file-list">${state.files.map(file => `<div class="file-row"><button data-action="${file.isDir ? 'open-folder' : isPreviewableFile(file.path) ? 'preview-file' : 'open-file'}" data-path="${escape(file.path)}">${fileIcon(file.name, file.isDir)}<span>${escape(file.name)}</span>${file.isDir ? icon('chevron') : ''}</button>${!file.isDir && /\.(html?|svg)$/i.test(file.path) ? button('open-file', 'View source of ' + file.name, 'file', 'file-attach', `data-path="${escape(file.path)}"`) : ''}${!file.isDir ? button('attach-file', 'Attach ' + file.name, 'plus', 'file-attach', `data-path="${escape(file.path)}"`) : ''}</div>`).join('') || '<div class="inspector-empty">This folder is empty.</div>'}</div>`; return;
+    target.innerHTML = `<div class="file-folder-path"><span>${escape(project()?.name)}</span>${state.openFolders.size ? button('collapse-folders', 'Collapse folders', 'minimize') : ''}</div><div class="file-list">${fileTree(state.files, 0) || '<div class="inspector-empty">This folder is empty.</div>'}</div>`; return;
   }
   if (state.jj?.isRepo && !state.jj.colocated) {
     showJjPanel(target, state.jj, {
@@ -2751,9 +2925,16 @@ async function previewFile(path: string, context = workspaceContext(), active?: 
   if (!browserPanel) throw new Error('Browser could not be opened.');
   await browserPanel.navigate(file.url);
 }
-async function openFile(path: string, kind: 'file' | 'diff', staged = false, context = workspaceContext()): Promise<void> {
+async function openFile(path: string, kind: 'file' | 'diff', staged = false, context = workspaceContext(), source = false): Promise<void> {
   const p = project(); if (!p) return;
-  const request = ++fileRequest, generation = state.generation; const content = await call<string>(kind === 'file' ? 'read_file' : 'git_diff', { ...context, path, staged }); if (request !== fileRequest || p.id !== state.projectId || generation !== state.generation) return;
+  // Files open as tabs in their task's conversation; from the board that is the task panel beside it.
+  if (kind === 'file') {
+    if (context.sessionId && context.sessionId !== state.sessionId) await selectSession(context.sessionId);
+    if (context.sessionId && context.sessionId !== state.sessionId) return;
+    if (state.view !== 'conversation' && !state.boardPanel) setWorkspaceView('conversation');
+    fileTabs.open(path, context, source); return;
+  }
+  const request = ++fileRequest, generation = state.generation; const content = await call<string>('git_diff', { ...context, path, staged }); if (request !== fileRequest || p.id !== state.projectId || generation !== state.generation) return;
   selectedFileContext = { ...context };
   state.selectedFile = path; state.selectedContent = content; state.selectedKind = kind; state.selectedStaged = staged; state.filePreviewLoading = false; state.inspector = true; renderInspector();
 }
@@ -3058,7 +3239,7 @@ async function showChoices(anchor: HTMLElement, options: ChoiceOptions): Promise
 async function showMode(anchor: HTMLElement): Promise<void> {
   const s = session(); if (!s || isRunning() || configuringSessions.has(s.id)) return;
   const generation = state.generation;
-  const modes = approvalModes(s.provider);
+  const modes = approvalModes(s.provider, s.mode);
   await showChoices(anchor, { title: 'Permissions', width: 320, items: modes.map(mode => ({ ...mode, selected: s.mode === mode.id })), onSelect: async id => {
     if (s.id !== state.sessionId || generation !== state.generation || isRunning() || configuringSessions.has(s.id)) throw new Error('Select the task again to change its permissions.');
     const chosen = modes.find(mode => mode.id === id); if (!chosen) throw new Error('Choose an available approval behavior.');
@@ -3279,6 +3460,7 @@ async function showSettings(section?: import('./settings').SettingsSection): Pro
 }
 function closeSettings(): void {
   settingsView?.dispose(); settingsView = undefined;
+  run(refreshCloudTargets());
   const host = $('#settings-page');
   host.hidden = true; host.replaceChildren();
   $('.workspace').classList.remove('settings-open');
@@ -3493,11 +3675,46 @@ function ensureBotProjects(): Promise<void> { return botProjectsLoad ??= reloadB
 async function reloadBotProjects(withProjects = true): Promise<void> {
   sidebarBots = await call<import('./bots').Bot[]>('bots_list').catch(() => sidebarBots);
   botProjects = new Set(sidebarBots.map(bot => bot.projectId));
+  taskBots = new Map(Object.entries(await call<Record<string, string>>('bot_task_links').catch(() => Object.fromEntries(taskBots))));
   // An earlier build could leave the filter on a bot's workspace; send it back to All projects.
   if (botProjects.has(state.projectFilter)) setProjectFilter('');
   // A new bot brings a workspace project; a renamed bot renames it.
   if (withProjects) state.projects = await call<Project[]>('list_projects');
   renderNavigation(); renderHeader();
+}
+/* A project task can start with a bot (#114): its first message carries the bot's brief and
+ * skills, and it uses the bot's harness and model. The task keeps its own project and checkout. */
+let taskBots = new Map<string, string>();
+const NO_BOT = 'none';
+function botTaskControl(task: Session, fresh: boolean): string {
+  const bot = sidebarBots.find(item => item.id === taskBots.get(task.id));
+  if (!fresh) return bot ? `<span class="composer-computer composer-computer-fixed" aria-label="Bot: ${escape(bot.name)} (fixed for this task)">${icon('bot')}<span>with ${escape(bot.name)}</span></span>` : '';
+  if (!sidebarBots.length || botProjects.has(task.projectId) || chatTask(task) || task.remoteDevice || task.cloud || remoteChoice !== LOCAL) return '';
+  const name = bot?.name ?? 'No bot';
+  return `<button type="button" id="composer-bot" class="composer-computer" data-action="bot-task-menu" aria-label="Bot: ${escape(name)}" aria-haspopup="dialog" aria-expanded="false" title="Start this task with a bot">${icon('bot')}<span>${escape(name)}</span>${icon('down')}</button>`;
+}
+async function showBotTaskMenu(anchor: HTMLElement): Promise<void> {
+  const task = session(); if (!task) return;
+  const chosen = taskBots.get(task.id) ?? NO_BOT;
+  const items = [{ id: NO_BOT, label: 'No bot', icon: 'close', selected: chosen === NO_BOT }, ...sidebarBots.map(bot => ({ id: bot.id, label: bot.name, description: bot.role, icon: 'bot', selected: bot.id === chosen }))];
+  await showChoices(anchor, { title: 'Bot', width: 280, items, onSelect: id => { closeChoiceMenu(); run(assignTaskBot(task, id === NO_BOT ? null : id)); } });
+}
+async function assignTaskBot(task: Session, botId: string | null): Promise<void> {
+  if (!newTaskView() || state.sessionId !== task.id) throw new Error('Choose a bot before the task\'s first message.');
+  configuringSessions.add(task.id);
+  try {
+    const bot = await call<import('./bots').Bot | null>('bot_assign_task', { sessionId: task.id, botId });
+    if (bot) {
+      taskBots.set(task.id, bot.id);
+      // The bot's harness and model become the task's defaults; the picker can still change them.
+      if (bot.provider !== task.provider || bot.model !== task.model) upsertSession(await call<Session>('configure_session', { sessionId: task.id, provider: bot.provider, model: bot.model }));
+    } else taskBots.delete(task.id);
+  } finally { configuringSessions.delete(task.id); }
+  if (state.sessionId === task.id) render();
+}
+/** The bot's brief for a task's next message, once per brief version; empty without a bot. */
+async function botTaskBrief(task: Session): Promise<string> {
+  return taskBots.has(task.id) ? await call<string | null>('bot_task_brief', { sessionId: task.id }) ?? '' : '';
 }
 const userProjects = (): Project[] => state.projects.filter(project => !botProjects.has(project.id) && !isChatProject(project));
 /** Whether a task runs as a projectless chat. */
@@ -3508,8 +3725,82 @@ const remoteHost: RemoteHost = { call, listen: (name, callback) => subscribe(nam
 let remoteTargets: RemoteTarget[] = [], remoteChoice = LOCAL;
 async function refreshRemoteTargets(signedIn: boolean): Promise<void> {
   remoteTargets = signedIn ? await call<RemoteTarget[]>('remote_targets').catch(() => remoteTargets) : [];
-  if (!remoteTargets.some(target => target.deviceId === remoteChoice && target.online)) remoteChoice = LOCAL;
+  if (!cloudProvider(remoteChoice) && !remoteTargets.some(target => target.deviceId === remoteChoice && target.online)) remoteChoice = LOCAL;
   renderHeader();
+}
+/* Cloud agents (docs/cloud-agents.md): connected cloud providers are "Run on" targets too,
+ * whether or not Connect is signed in. A cloud task is an ordinary session with `cloud`. */
+let cloudTargets: CloudTarget[] = [];
+async function refreshCloudTargets(): Promise<void> {
+  cloudTargets = await call<CloudTarget[]>('cloud_agent_targets').catch(() => cloudTargets);
+  const chosen = cloudProvider(remoteChoice);
+  if (chosen && !cloudTargets.some(target => target.ready && target.provider === chosen)) remoteChoice = LOCAL;
+  renderHeader();
+}
+/** Redraws the strip in place, so progress never re-renders the prompt someone is typing in. */
+function syncCloudStrip(): void {
+  const s = session(), old = document.querySelector<HTMLElement>('#composer-area .cloud-strip'), composer = document.querySelector('#composer');
+  if (!s || !composer || old?.querySelector('[aria-expanded="true"]')) return;
+  const markup = cloudStrip(s);
+  if (old) { if (old.outerHTML !== markup) { if (markup) old.outerHTML = markup; else old.remove(); } }
+  else if (markup) composer.insertAdjacentHTML('beforebegin', markup);
+}
+function onCloudProgress(event: { sessionId: string; stage: CloudStage; detail?: string | null }): void {
+  const task = state.sessions.find(item => item.id === event.sessionId);
+  // A task that just turned into a cloud task may not be listed as one yet.
+  if (!task?.cloud) { run(reloadSessions()); return; }
+  task.cloud = { ...task.cloud, stage: event.stage, detail: event.detail ?? null };
+  if (task.id === state.sessionId) { syncCloudStrip(); renderHeader(); }
+  renderNavigation();
+}
+async function initCloudAgents(): Promise<void> {
+  // bridge.ts has no typed overload for this event yet.
+  await (subscribe as unknown as (name: string, callback: typeof onCloudProgress) => Promise<() => void>)('cloud-agent://progress', onCloudProgress);
+  await refreshCloudTargets();
+}
+async function showCloudMenu(anchor: HTMLElement): Promise<void> {
+  const s = session(); if (!s?.cloud) return;
+  await showChoices(anchor, { title: 'Cloud machine', width: 240, items: cloudActionItems(s), onSelect: async id => {
+    closeChoiceMenu();
+    if (id === 'delete' && !await confirmDeleteMachine(s)) return;
+    try { await call('cloud_agent_action', { sessionId: s.id, action: id }); }
+    catch (error) { notify(errorText(error)); return; }
+    if (id === 'open') openVm();
+    else if (id === 'delete') notify('Deleted the cloud machine. Your next message creates a new one.');
+  } });
+}
+function confirmDeleteMachine(s: Session): Promise<boolean> {
+  const dialog = modal('Delete cloud machine?', deleteMachineDialog(s));
+  const form = dialog.querySelector<HTMLFormElement>('#cloud-delete-form')!;
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(false), { once: true });
+    form.addEventListener('submit', event => { event.preventDefault(); event.stopPropagation(); resolve(true); closeModal(); }, { once: true });
+  });
+}
+/** A New task sent with a cloud provider chosen: the same message content as a Connect start, on a cloud machine. */
+async function sendCloud(s: Session, target: CloudTarget, draft: string, text: string): Promise<void> {
+  const filePaths = [...state.attachments], promptItems = attachments.list(s.id);
+  const refusal = harnessRefusal(s.provider, provider(s.provider)?.name ?? s.provider);
+  if (refusal) throw new Error(refusal);
+  if ((state.browserAttachments.get(s.id) ?? []).length || (state.moodboardAttachments.get(s.id) ?? []).length || attachments.imageIds(promptItems).length) throw new Error(`Images and browser captures can’t be sent to a cloud machine yet. Remove them, or run on this computer.`);
+  configuringSessions.add(s.id);
+  try {
+    const contexts = await Promise.all(filePaths.map(path => fileContext(s, path)));
+    const content = text + contexts.join('') + attachments.contextFor(promptItems) + await github.contextFor(s.projectId, s.id, text) + tokenSaver.contextFor(s.id);
+    const prompt = () => document.querySelector<HTMLTextAreaElement>('#prompt');
+    if (state.sessionId !== s.id || prompt()?.value !== draft) throw new Error('Your task or message changed. Send it again.');
+    const started = await call<Session>('cloud_agent_start', {
+      // The empty New task draft becomes the cloud task, so no stray draft is left behind.
+      sessionId: s.id, projectId: s.projectId, provider: target.provider, prompt: content, harness: s.provider, model: s.model, mode: s.mode, effort: s.reasoningEffort ?? null,
+    });
+    attachments.consume(s.id, promptItems);
+    state.attachments = state.attachments.filter(path => !filePaths.includes(path));
+    const field = prompt(); if (field?.dataset.sessionId === s.id) field.value = '';
+    state.drafts.delete(s.id);
+    remoteChoice = LOCAL;
+    await reloadSessions();
+    state.query = ''; await selectSession(started.id, true);
+  } finally { configuringSessions.delete(s.id); }
 }
 async function initRemote(): Promise<void> {
   let signedIn = false;
@@ -3520,9 +3811,13 @@ async function initRemote(): Promise<void> {
   if (status) { signedIn = status.signedIn; await refreshRemoteTargets(signedIn); }
 }
 async function showComputerMenu(anchor: HTMLElement): Promise<void> {
-  await showChoices(anchor, { title: 'Run on', width: 280, items: computerItems(remoteTargets, remoteChoice), onSelect: id => {
-    closeChoiceMenu(); remoteChoice = id; renderHeader();
+  await showChoices(anchor, { title: 'Run on', width: 280, items: computerItems(remoteTargets, remoteChoice, cloudTargets), onSelect: id => {
+    closeChoiceMenu();
+    if (id === SETUP_CHOICE) { run(showSettings('cloud')); return; }
+    if (id === CONNECT_SETUP) { run(showSettings('remote')); return; }
+    remoteChoice = id; renderHeader();
     const task = session();
+    if (cloudProvider(id)) { if (task && newTaskView()) { const refusal = harnessRefusal(task.provider, provider(task.provider)?.name ?? task.provider); if (refusal) notify(refusal); } return; }
     if (task && newTaskView()) run(adaptPickerToComputer(task, id, remoteTargets.find(item => item.deviceId === id)?.name ?? 'That computer'));
   } });
 }
@@ -3691,6 +3986,8 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'bot-pause': if (element.dataset.bot) { const bot = sidebarBots.find(item => item.id === element.dataset.bot); if (bot) { await call('bot_set_paused', { botId: bot.id, paused: !bot.paused }); notify(bot.paused ? `${bot.name} resumed` : `${bot.name} paused`); await reloadBotProjects(false); } } break;
     case 'open-bot': if (element.dataset.bot) await openBot(element.dataset.bot); break;
     case 'computer-menu': await showComputerMenu(element); break;
+    case 'bot-task-menu': await showBotTaskMenu(element); break;
+    case 'cloud-menu': await showCloudMenu(element); break;
     case 'toggle-bots-view': setSidebarView(sidebarView === 'bots' ? 'tasks' : 'bots'); break;
     case 'toggle-todos-view': setSidebarView(sidebarView === 'todos' ? 'tasks' : 'todos'); break;
     case 'import-conversations': await showConversationImport(); break;
@@ -3714,7 +4011,7 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'copy-file': await navigator.clipboard.writeText(state.selectedContent); notify('File copied'); break;
     case 'copy-path': await navigator.clipboard.writeText(workspacePath()); notify(session()?.worktreePath ? 'Worktree path copied' : 'Project path copied'); break;
     case 'terminal': await toggleTerminal(); break;
-    case 'toggle-inspector': state.inspector = inspectorSuppressed || !state.inspector; inspectorSuppressed = false; renderInspector(); break;
+    case 'toggle-inspector': state.inspector = inspectorChosen = inspectorSuppressed || !state.inspector; inspectorSuppressed = false; renderInspector(); break;
     case 'tab-vm': openVm(); break;
     case 'tab-design': inspectorSuppressed = false; state.inspector = true; state.inspectorTab = 'design'; state.selectedKind = ''; renderInspector(); break;
     case 'deploy': await showDeploy(element); break;
@@ -3726,12 +4023,14 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'tab-search': state.inspectorTab = 'search'; state.selectedKind = ''; renderInspector(); document.querySelector<HTMLInputElement>('#inspector-content .search-input')?.focus(); break;
     case 'browser': inspectorSuppressed = false; state.inspector = true; state.inspectorTab = 'browser'; state.selectedKind = ''; renderInspector(); break;
     case 'refresh-inspector': if (state.inspectorTab === 'pull') { pullView.forget(state.sessionId); renderInspector(); break; } if (state.inspectorTab === 'search') searchPanel.refresh(); refreshFileLinks(workspaceContext()); await refreshInspector(); break;
-    case 'open-folder': state.filePath = element.dataset.path!; await refreshInspector(); break;
-    case 'parent-folder': state.filePath = state.filePath.split('/').slice(0, -1).join('/'); await refreshInspector(); break;
+    case 'toggle-file-folder': await toggleFolder(element.dataset.path!); break;
+    case 'collapse-folders': state.openFolders = new Set(); state.folderFiles = new Map(); renderInspector(); document.querySelector<HTMLElement>('#inspector-content .file-row button')?.focus(); break;
     case 'run-project': if (!element.dataset.sessionId || element.dataset.sessionId === state.sessionId) await projectRunner.run(); break;
     case 'preview-file': await previewFile(element.dataset.path!); break;
     case 'preview-selected-file': await previewFile(state.selectedFile, selectedFileContext); break;
     case 'open-file': await openFile(element.dataset.path!, 'file'); break;
+    case 'open-message-attachment': await openMessageAttachment(element); break;
+    case 'view-source': await openFile(element.dataset.path!, 'file', false, workspaceContext(), true); break;
     case 'open-diff': await openFile(element.dataset.path!, 'diff', element.dataset.staged === 'true'); break;
     case 'back-inspector': state.selectedKind = ''; renderInspector(); break;
     case 'attach': await attachments.openMenu(element); break;
@@ -3754,6 +4053,7 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     }
     case 'architect-setup': await showArchitectSetup(element); break;
     case 'team-toggle': await toggleTeam(); break;
+    case 'steer': await steerFromComposer(); break;
     case 'stop': if (session()) { runEndings.set(state.sessionId, 'stopped'); await call(teams.get(state.sessionId) ? 'architect_control' : 'stop_session', { sessionId: state.sessionId, ...(teams.get(state.sessionId) ? { action: 'stop' } : {}) }); notify('Stopping task…'); } break;
     case 'approval-allow': case 'approval-deny': await respondApproval(state.sessionId, element.dataset.request!, name === 'approval-allow'); break;
     case 'approval-allow-all': case 'approval-deny-all': { const sessionId = state.sessionId; for (const id of [...state.streams.get(sessionId)?.approvals.keys() ?? []]) await respondApproval(sessionId, id, name === 'approval-allow-all'); break; }
@@ -3763,7 +4063,7 @@ async function action(name: string, element: HTMLElement): Promise<void> {
   }
 }
 mountExternalLinks(document, url => call('open_external_url', { url }), report);
-document.addEventListener('click', event => { if ((event.target as Element).closest('.markdown,.streaming-content,.message-content')) return; const element = (event.target as Element).closest<HTMLElement>('[data-action]'); if (!element || element instanceof HTMLButtonElement && element.disabled) return; event.preventDefault(); run(action(element.dataset.action!, element)); });
+document.addEventListener('click', event => { const target = event.target as Element; if (target.closest('.markdown,.streaming-content,.message-content') && !target.closest('.message-attachments')) return; const element = target.closest<HTMLElement>('[data-action]'); if (!element || element instanceof HTMLButtonElement && element.disabled) return; event.preventDefault(); run(action(element.dataset.action!, element)); });
 document.addEventListener('submit', event => {
   const form = event.target as HTMLFormElement; event.preventDefault();
   if (form.id === 'composer') { run(send()); return; }
@@ -3828,7 +4128,7 @@ document.addEventListener('keydown', event => {
   if (command && event.key.toLowerCase() === 'n') { event.preventDefault(); if (state.view === 'board') showBoardTaskForm(); else run(createTask()); }
   else if (command && event.key.toLowerCase() === 'j') { event.preventDefault(); run(toggleTerminal()); }
   else if (command && event.key === ',') { event.preventDefault(); run(showSettings()); }
-  else if (command && event.shiftKey && event.key.toLowerCase() === 'b') { event.preventDefault(); state.inspector = inspectorSuppressed || !state.inspector; inspectorSuppressed = false; renderInspector(); }
+  else if (command && event.shiftKey && event.key.toLowerCase() === 'b') { event.preventDefault(); state.inspector = inspectorChosen = inspectorSuppressed || !state.inspector; inspectorSuppressed = false; renderInspector(); }
   else if (event.key === 'Enter' && (event.target as HTMLElement).id === 'prompt' && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     // While an agent works, Enter queues the message and Command/Ctrl Enter steers the running turn.
@@ -3879,10 +4179,21 @@ async function boot(): Promise<void> {
   run(subscribe('vm-changed', event => { if (event && !Array.isArray(event) && event.show) openVm(); void vmPanel?.refresh(); }).then(() => undefined));
   // bridge.ts has no typed overload for this event yet.
   run((subscribe as (name: string, callback: () => void) => Promise<() => void>)('design-changed', () => void designPanel?.refresh()).then(() => undefined));
-  run(subscribe('agent-event', (event: AgentEvent) => { if (event.kind === 'done' && event.sessionId === state.sessionId) void designPanel?.refresh(); }).then(() => undefined));
+  run(subscribe('agent-event', (event: AgentEvent) => {
+    if (event.kind !== 'done' || event.sessionId !== state.sessionId) return;
+    void designPanel?.refresh();
+    if (document.hasFocus()) markTraySeen(event.sessionId);
+  }).then(() => undefined));
+  run((subscribe as (name: string, callback: (event: unknown) => void) => Promise<() => void>)('tray-open-session', sessionId => run((async () => {
+    if (typeof sessionId !== 'string') return;
+    if (!state.sessions.some(s => s.id === sessionId)) await reloadSessions();
+    if (state.view !== 'conversation') state.boardPanel = true;
+    await selectSession(sessionId, true);
+  })())).then(() => undefined));
   run(subscribe('simulator-changed', event => { if (event?.show) openSimulator(); void simulatorPanel?.refresh(); }).then(() => undefined));
   run(subscribe('bots-changed', () => run((async () => { botProjectsLoad = reloadBotProjects(); await botProjectsLoad; botsView?.refresh(); })())).then(() => undefined));
   run(initRemote());
+  run(initCloudAgents());
   run(subscribe('bot-notification', event => { if (event?.text) notify(String(event.text).replace(/\s+/g, ' ').slice(0, 160)); }).then(() => undefined));
   // Bots appear in the sidebar once loaded; startup does not wait for them.
   botProjectsLoad = reloadBotProjects(false); run(botProjectsLoad);
@@ -3934,20 +4245,7 @@ async function boot(): Promise<void> {
   if (!preview && !state.providers.some(p => p.installed)) notify('Open Settings to check your installed agent CLIs.');
 }
 // PandaCode's own updates: checked on GitHub Releases, installed when no agent is working.
-const updates = startAppUpdates({ busy: () => state.sessions.some(task => isRunning(task.id)), notify });
-{
-  const pill = $('#update-status');
-  const paint = () => {
-    const current = updates.state;
-    pill.hidden = current.kind !== 'ready' && current.kind !== 'installing';
-    if (current.kind !== 'ready' && current.kind !== 'installing') return;
-    pill.title = current.kind === 'ready' ? `PandaCode ${current.version} is ready. Restart now, or it restarts on its own when your agents are done.` : `Installing ${current.version}…`;
-    (pill as HTMLButtonElement).disabled = current.kind === 'installing';
-  };
-  updates.subscribe(paint);
-  pill.addEventListener('click', () => { void updates.restart(); });
-  paint();
-}
+mountUpdatePill($('#update-status') as HTMLButtonElement, startAppUpdates({ busy: () => state.sessions.some(task => isRunning(task.id)), notify }));
 const agentUpdates = initializeAgentUpdates({
   modal, closeModal, report, providers: () => state.providers,
   providersChanged: async () => { await discoverSettingsProviders(); refreshModelLabels(); slashPicker?.refresh(true); },

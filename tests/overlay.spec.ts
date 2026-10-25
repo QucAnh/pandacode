@@ -235,7 +235,7 @@ test('launcher discovers full model names on demand and launches the chosen harn
   const claude = page.getByRole('button',{name:'Claude Code · Claude Sonnet 5',exact:true});
   await expect(claude).toBeVisible();
   await expect(claude.locator('.provider-logo')).toHaveCount(1);
-  await expect(page.getByRole('button',{name:'Antigravity · Default',exact:true})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Antigravity · Default',exact:true})).toHaveCount(0);
   await page.getByRole('searchbox',{name:'Search harnesses and models'}).fill('Claude Sonnet 5');
   await claude.click();
   await expect(page.getByRole('dialog',{name:'Harness and model'})).toHaveCount(0);
@@ -359,7 +359,7 @@ test('launcher model picker fits the minimum window and Escape only closes the p
   expect(rect!.x + rect!.width).toBeLessThanOrEqual(490);
   expect(rect!.y + rect!.height).toBeLessThanOrEqual(410);
   await page.getByRole('searchbox',{name:'Search harnesses and models'}).fill('GLM Coding Plan');
-  const glm = page.locator('.model-menu-option[data-provider="glm"][data-model="glm-4.7"]');
+  const glm = page.locator('.model-menu-option[data-provider="glm"][data-model="glm-5.3"]');
   await expect(glm).toBeInViewport();
   await expect(glm.locator('.provider-logo')).toHaveCount(1);
   await expect(picker).toHaveAttribute('data-popover-state','open');

@@ -266,6 +266,11 @@ fn harness_command(context: &HarnessContext<'_>) -> Result<CommandBuilder, Strin
             cmd.env(key, value);
         }
     }
+    if context.provider == "devin" {
+        // The REPL runs its agent as a `devin acp` child, which would otherwise
+        // wait for host credentials when PandaCode starts inside Devin Desktop.
+        cmd.env_remove("ACP_BACKEND");
+    }
     if context.provider == "opencode" {
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
@@ -281,7 +286,7 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
     if provider == "antigravity" {
         return Err("Antigravity's ACP server does not have an interactive console. Use its synced commands in the composer, or open the agy CLI separately.".into());
     }
-    if !matches!(provider, "codex" | "claude" | "kimi" | "glm" | "opencode" | "grok" | "mimo" | "pi" | "omp" | "github-copilot") {
+    if !matches!(provider, "codex" | "claude" | "kimi" | "glm" | "opencode" | "grok" | "mimo" | "pi" | "omp" | "github-copilot" | "muse" | "cline" | "devin") {
         return Err("Choose a supported coding harness.".into());
     }
     if provider == "github-copilot" {
@@ -320,8 +325,9 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
     if let Some(id) = resume_id {
         args.push(
             match provider {
-                "codex" => "resume",
-                "claude" | "glm" | "mimo" | "grok" => "--resume",
+                "codex" | "muse" => "resume",
+                "claude" | "glm" | "mimo" | "grok" | "devin" => "--resume",
+                "cline" => "--id",
                 _ => "--session",
             }
             .into(),
@@ -356,12 +362,26 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
                 "plan" => "plan",
                 "full" => "bypassPermissions",
                 "auto" => "acceptEdits",
+                "review" => "auto",
                 _ => "default",
             };
             args.extend(["--permission-mode".into(), mode.into()]);
             if context.mode == "full" {
                 args.push("--allow-dangerously-skip-permissions".into());
             }
+        }
+        "muse" => {
+            // The TUI's flags: approval policy plus the same sandbox posture as task runs.
+            let approval = match context.mode {
+                "auto" => "on-request",
+                "full" => "never",
+                _ => "untrusted",
+            };
+            args.extend(["--approval-mode".into(), approval.into()]);
+            if context.mode == "full" {
+                args.push("--disable-approval".into());
+            }
+            args.extend(crate::providers::muse_sandbox_args(context.mode).iter().map(|arg| (*arg).into()));
         }
         "opencode" => {
             args.extend([
@@ -383,6 +403,27 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
             };
             args.extend(["--no-auto-update".into(), "--permission-mode".into(), mode.into()]);
         }
+        "devin" => {
+            // The REPL's permission modes have no Plan; ACP tasks get Devin's own Plan mode.
+            let mode = match context.mode {
+                "plan" => return Err("Devin's console cannot start in Plan mode. Use task chat, or type /plan in the console.".into()),
+                "full" => "dangerous",
+                _ => "accept-edits",
+            };
+            args.extend(["--permission-mode".into(), mode.into()]);
+        }
+        "cline" => {
+            args.push("-i".into());
+            if context.mode == "plan" {
+                args.push("--plan".into());
+            } else if context.mode == "full" {
+                args.extend(["--auto-approve".into(), "true".into()]);
+            } else {
+                // Cline CLI defaults --auto-approve to true unless explicitly turned off.
+                // For approval modes (ask, review, auto), enforce manual tool confirmation.
+                args.extend(["--auto-approve".into(), "false".into()]);
+            }
+        }
         _ => {
             match context.mode {
                 "plan" => args.push("--plan".into()),
@@ -402,7 +443,7 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
         }
         args.extend(["--model".into(), model.into()]);
     } else if provider == "glm" {
-        args.extend(["--model".into(), "glm-4.7".into()]);
+        args.extend(["--model".into(), "glm-5.3".into()]);
     } else if provider == "mimo" {
         args.extend(["--model".into(), "mimo-v2.6-pro".into()]);
     }
@@ -415,7 +456,8 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
             ]),
             "claude" | "glm" | "mimo" => args.extend(["--effort".into(), effort.into()]),
             "grok" => args.extend(["--reasoning-effort".into(), effort.into()]),
-            "pi" | "omp" => args.extend(["--thinking".into(), effort.into()]),
+            "pi" | "omp" | "cline" => args.extend(["--thinking".into(), effort.into()]),
+            "muse" => args.extend(["--reasoning-effort".into(), effort.into()]),
             _ => {} // The Kimi TUI restores its persisted thinking setting.
         }
     }
@@ -892,6 +934,7 @@ mod tests {
             ("kimi", "--session"),
             ("glm", "--resume"),
             ("opencode", "--session"),
+            ("cline", "--id"),
         ] {
             let context = HarnessContext {
                 session_id: "task",
@@ -941,6 +984,75 @@ mod tests {
             assert!(harness_arguments(&HarnessContext { mode, ..context }).unwrap_err().contains("Full access"));
         }
         assert!(harness_arguments(&HarnessContext { reasoning_effort: Some("max"), ..context }).is_err());
+    }
+
+    #[test]
+    fn muse_console_resumes_with_the_task_mode_model_and_effort() {
+        let context = HarnessContext {
+            session_id: "task",
+            provider: "muse",
+            resume_id: Some("01a16681-4036-7383-ab96-9dd8865524d8"),
+            model: Some("muse-spark-1.3"),
+            reasoning_effort: Some("low"),
+            mode: "plan",
+        };
+        let args = harness_arguments(&context).unwrap();
+        assert_eq!(&args[..2], &["resume", "01a16681-4036-7383-ab96-9dd8865524d8"]);
+        for pair in [["--approval-mode", "untrusted"], ["--model", "muse-spark-1.3"], ["--reasoning-effort", "low"]] {
+            assert!(args.windows(2).any(|args| args == pair), "{args:?}");
+        }
+        assert!(args.contains(&"--disable-write".to_owned()) && args.contains(&"--disable-shell".to_owned()));
+        let full = harness_arguments(&HarnessContext { mode: "full", resume_id: None, ..context }).unwrap();
+        assert!(full.contains(&"--disable-approval".to_owned()) && full.contains(&"--disable-sandbox".to_owned()));
+    }
+
+    #[test]
+    fn cline_console_sets_tui_mode_effort_and_resume() {
+        let context = HarnessContext {
+            session_id: "task",
+            provider: "cline",
+            resume_id: None,
+            model: Some("anthropic/claude-sonnet-5.5"),
+            reasoning_effort: Some("high"),
+            mode: "plan",
+        };
+        let args = harness_arguments(&context).unwrap();
+        assert_eq!(
+            args,
+            [
+                "-i",
+                "--plan",
+                "--model",
+                "anthropic/claude-sonnet-5.5",
+                "--thinking",
+                "high"
+            ]
+        );
+
+        let full_context = HarnessContext {
+            session_id: "task",
+            provider: "cline",
+            resume_id: Some("1792719287191_NBdt7_cli"),
+            model: None,
+            reasoning_effort: None,
+            mode: "full",
+        };
+        let full_args = harness_arguments(&full_context).unwrap();
+        assert_eq!(
+            full_args,
+            ["--id", "1792719287191_NBdt7_cli", "-i", "--auto-approve", "true"]
+        );
+
+        let ask_context = HarnessContext {
+            session_id: "task",
+            provider: "cline",
+            resume_id: None,
+            model: None,
+            reasoning_effort: None,
+            mode: "ask",
+        };
+        let ask_args = harness_arguments(&ask_context).unwrap();
+        assert_eq!(ask_args, ["-i", "--auto-approve", "false"]);
     }
 
     #[test]
@@ -1067,6 +1179,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mimo, ["--permission-mode", "acceptEdits", "--model", "mimo-v2.6-pro"]);
+        // Approve for me is Claude Code's auto mode, as in task runs.
+        for provider in ["claude", "glm", "mimo"] {
+            let review = harness_arguments(&HarnessContext { provider, mode: "review", ..context }).unwrap();
+            assert!(review.windows(2).any(|args| args == ["--permission-mode", "auto"]), "{provider}");
+        }
     }
 
     struct TestShell {

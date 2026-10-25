@@ -10,7 +10,7 @@ export function assertHostedRunner(env, target, platform = process.platform) {
   if (env.GITHUB_ACTIONS !== 'true' || env.RUNNER_ENVIRONMENT !== 'github-hosted' || !env.RUNNER_TEMP || !isAbsolute(env.RUNNER_TEMP)) {
     throw new Error('Startup smoke is restricted to disposable GitHub-hosted runners.');
   }
-  if (!['windows-x86_64', 'linux-x86_64', 'linux-aarch64'].includes(target) || targetConfig(target).platform !== platform) {
+  if (!['windows-x86_64', 'windows-aarch64', 'linux-x86_64', 'linux-aarch64'].includes(target) || targetConfig(target).platform !== platform) {
     throw new Error('Startup smoke requires the matching Windows or Linux host.');
   }
 }
@@ -96,8 +96,11 @@ async function killTree(child, platform) {
   if (!child.pid) return;
   if (platform === 'win32') {
     // The owned root process remains alive until taskkill resolves its children.
+    // Resolve it under System32: PATH need not carry System32 (Git Bash strips it),
+    // and a missing taskkill leaves the fixture running for the whole test run.
+    const taskkill = join(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows', 'System32', 'taskkill.exe');
     await new Promise(resolve => {
-      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore', timeout: 10_000 });
+      const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore', timeout: 10_000 });
       killer.once('error', resolve); killer.once('close', resolve);
     });
   } else {

@@ -2,6 +2,7 @@ mod agent_tools;
 mod agent_usage;
 mod agent_updates;
 mod agent_usage_providers;
+mod app_updates;
 mod appearance;
 mod architect;
 mod bots;
@@ -26,6 +27,7 @@ mod simulator;
 mod vm;
 mod secret_store;
 mod cloud;
+mod cloud_agents;
 mod capabilities;
 mod vsix_themes;
 mod token_saver;
@@ -61,8 +63,10 @@ mod usage_keychain;
 mod usage_ledger;
 mod workspace;
 mod jj;
+mod tray;
 
 pub use usage_keychain::handle_usage_keychain_helper;
+pub use cloud_agents::handle_cloud_bridge;
 
 use providers::{AgentEvent, RunConfig, RunInput};
 use serde::Serialize;
@@ -84,6 +88,7 @@ struct RunningAgent {
     stopped: Arc<AtomicBool>,
     run_id: String,
     approvals: Arc<Mutex<HashSet<String>>>,
+    pending_requests: Arc<Mutex<HashMap<String, AgentEvent>>>,
     subagents: Arc<Mutex<subagent_state::SubagentState>>,
     assistant: Arc<Mutex<String>>,
     /// When the harness last sent anything; team watchdogs stop a turn that went silent.
@@ -96,6 +101,7 @@ impl RunningAgent {
             stopped,
             run_id: uuid::Uuid::new_v4().to_string(),
             approvals: Arc::new(Mutex::new(HashSet::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(subagent_state::SubagentState::default())),
             assistant: Arc::new(Mutex::new(String::new())),
             last_event: Arc::new(std::sync::atomic::AtomicI64::new(storage::now())),
@@ -117,9 +123,10 @@ impl RunningAgent {
         request_id: String,
         approved: bool,
     ) -> Result<()> {
-        // Lock order is registry (caller) -> approvals -> store. A new request
+        // Lock order is registry (caller) -> approvals -> pending requests -> store. A new request
         // cannot become waiting between deciding the status and persisting it.
         let mut approvals = self.approvals.lock().map_err(|error| error.to_string())?;
+        let mut pending_requests = self.pending_requests.lock().map_err(|error| error.to_string())?;
         if self.stopped.load(Ordering::SeqCst) || !approvals.contains(&request_id) {
             return Err("This approval is no longer pending.".into());
         }
@@ -133,7 +140,7 @@ impl RunningAgent {
             approved,
         })
         .map_err(|_| "Agent has stopped.".to_string())?;
-        approvals.remove(&request_id);
+        remove_pending_request(&mut approvals, Some(&mut pending_requests), &request_id);
         store.status(
             session_id,
             if approvals.is_empty() {
@@ -159,9 +166,20 @@ impl RunningAgent {
 }
 type Agents = Arc<Mutex<HashMap<String, RunningAgent>>>;
 
+#[cfg(test)]
 fn save_approval(
     store: &Mutex<Store>,
     approvals: &Mutex<HashSet<String>>,
+    run_id: &str,
+    activity: &mut AgentEvent,
+) -> Result<()> {
+    save_approval_with_pending(store, approvals, None, run_id, activity)
+}
+
+fn save_approval_with_pending(
+    store: &Mutex<Store>,
+    approvals: &Mutex<HashSet<String>>,
+    pending_requests: Option<&Mutex<HashMap<String, AgentEvent>>>,
     run_id: &str,
     activity: &mut AgentEvent,
 ) -> Result<()> {
@@ -172,11 +190,8 @@ fn save_approval(
     let request_id = format!("{run_id}:{request_id}");
     activity.request_id = Some(request_id.clone());
     let mut approvals = approvals.lock().map_err(|error| error.to_string())?;
-    if matches!(activity.kind.as_str(), "approval" | "input_request") {
-        approvals.insert(request_id);
-    } else {
-        approvals.remove(&request_id);
-    }
+    let mut pending_requests = pending_requests.map(|requests| requests.lock().map_err(|error| error.to_string())).transpose()?;
+    update_pending_request(&mut approvals, pending_requests.as_deref_mut(), &request_id, activity);
     store.lock().map_err(|error| error.to_string())?.status(
         &activity.session_id,
         if approvals.is_empty() {
@@ -185,6 +200,62 @@ fn save_approval(
             "waiting"
         },
     )
+}
+
+fn update_pending_request(
+    approvals: &mut HashSet<String>,
+    pending_requests: Option<&mut HashMap<String, AgentEvent>>,
+    request_id: &str,
+    activity: &AgentEvent,
+) {
+    if matches!(activity.kind.as_str(), "approval" | "input_request") {
+        approvals.insert(request_id.to_owned());
+        if let Some(pending_requests) = pending_requests {
+            pending_requests.insert(request_id.to_owned(), activity.clone());
+        }
+    } else {
+        remove_pending_request(approvals, pending_requests, request_id);
+    }
+}
+
+fn remove_pending_request(
+    approvals: &mut HashSet<String>,
+    pending_requests: Option<&mut HashMap<String, AgentEvent>>,
+    request_id: &str,
+) {
+    approvals.remove(request_id);
+    if let Some(pending_requests) = pending_requests {
+        pending_requests.remove(request_id);
+    }
+}
+
+#[cfg(test)]
+mod pending_request_tests {
+    use super::*;
+
+    #[test]
+    fn remote_pending_request_payloads_are_added_and_cancelled_with_the_approval_id() {
+        let request_id = "run-id:provider-id";
+        let mut approvals = HashSet::new();
+        let mut pending = HashMap::new();
+        let request = AgentEvent {
+            session_id: "task-id".into(),
+            kind: "input_request".into(),
+            text: "Choose one".into(),
+            request_id: Some(request_id.into()),
+            data: Some(serde_json::json!({"questions": [{"question": "Which?"}]})),
+            tool: None,
+        };
+        update_pending_request(&mut approvals, Some(&mut pending), request_id, &request);
+        assert!(approvals.contains(request_id));
+        assert_eq!(pending.get(request_id).unwrap().text, "Choose one");
+        assert_eq!(pending.get(request_id).unwrap().data, request.data);
+
+        let cancelled = AgentEvent { kind: "input_cancelled".into(), ..request };
+        update_pending_request(&mut approvals, Some(&mut pending), request_id, &cancelled);
+        assert!(!approvals.contains(request_id));
+        assert!(!pending.contains_key(request_id));
+    }
 }
 
 #[cfg(test)]
@@ -211,8 +282,10 @@ fn reconcile_inactive_task(
         task.task_stage = "in_progress".into();
         return task;
     }
-    // A mirror runs on its host; its events keep the status.
-    if matches!(task.status.as_str(), "running" | "waiting") && !agents.contains_key(&task.id) && task.remote_device.is_none() {
+    // A mirror runs on its host; its events keep the status. A cloud run keeps going on its
+    // machine until `cloud_agents::resume` re-attaches and finishes it.
+    if matches!(task.status.as_str(), "running" | "waiting") && !agents.contains_key(&task.id) && task.remote_device.is_none()
+        && !cloud_agents::load(store, &task.id).ok().flatten().is_some_and(|cloud| cloud.active()) {
         if let Err(error) = store.finish_task_turn(&task.id, false, true) {
             eprintln!("Could not persist interrupted task state: {error}");
         }
@@ -521,6 +594,10 @@ async fn remove_project(state: State<'_, AppState>, project_id: String) -> Resul
 }
 #[tauri::command]
 async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>> {
+    listed_sessions(&state)
+}
+/// Tasks as the sidebar shows them, with stale running states settled.
+pub(crate) fn listed_sessions(state: &AppState) -> Result<Vec<Session>> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     Ok(store
@@ -1157,6 +1234,9 @@ async fn send_message(
         remote::route(&app, &state, &session_id, "task.send", serde_json::json!({"text": text})).await?;
         return Ok(());
     }
+    if image_ids.as_ref().is_some_and(|ids| !ids.is_empty()) && cloud_agents::transport::is_cloud(&session_id) {
+        return Err("Images can't be sent to a cloud machine yet.".into());
+    }
     launch_task_in_project(
         app,
         state,
@@ -1199,6 +1279,8 @@ struct RunAdmission<'a> {
     command: Option<PreparedCommand>,
     goal: Option<goal_state::GoalRequest>,
     team: Option<architect::Admission>,
+    /// Re-attach to a cloud task's remote run (`cloud_agents::resume`): no new turn.
+    cloud_attach: bool,
 }
 
 struct PreparedRun {
@@ -1209,6 +1291,7 @@ struct PreparedRun {
     context_handoff: Option<i64>,
     run_id: String,
     pending_approvals: Arc<Mutex<HashSet<String>>>,
+    pending_requests: Arc<Mutex<HashMap<String, AgentEvent>>>,
     subagents: Arc<Mutex<subagent_state::SubagentState>>,
     assistant: Arc<Mutex<String>>,
     last_event: Arc<std::sync::atomic::AtomicI64>,
@@ -1256,6 +1339,9 @@ fn prepare_task_run_in_project(
     let store = state.store.lock().map_err(|e| e.to_string())?;
     architect::validate_admission(&store, &session_id, admission.team.as_ref())?;
     let session = reconcile_inactive_task(&store, &agents, store.session(&session_id)?);
+    if admission.cloud_attach {
+        return prepare_cloud_attach(&store, &mut agents, session, tx, stopped);
+    }
     if admission.goal.is_some() && session.provider != "codex" {
         return Err(
             "Goals require the Codex harness. The task provider changed before it started.".into(),
@@ -1385,6 +1471,7 @@ fn prepare_task_run_in_project(
     let agent = RunningAgent::new(tx, stopped.clone());
     let run_id = agent.run_id.clone();
     let pending_approvals = agent.approvals.clone();
+    let pending_requests = agent.pending_requests.clone();
     let subagents = agent.subagents.clone();
     let assistant = agent.assistant.clone();
     let last_event = agent.last_event.clone();
@@ -1397,11 +1484,81 @@ fn prepare_task_run_in_project(
         context_handoff,
         run_id,
         pending_approvals,
+        pending_requests,
         subagents,
         assistant,
         last_event,
         team: admission.team,
     })
+}
+
+/// A run that re-attaches to a cloud task's remote run: the turn it belongs to was saved
+/// before; what came after is rebuilt by replaying the run's whole log.
+fn prepare_cloud_attach(
+    store: &Store,
+    agents: &mut HashMap<String, RunningAgent>,
+    session: Session,
+    tx: UnboundedSender<RunInput>,
+    stopped: Arc<AtomicBool>,
+) -> Result<PreparedRun> {
+    let session_id = session.id.clone();
+    let cloud = cloud_agents::load(store, &session_id)?
+        .filter(|cloud| cloud.active())
+        .ok_or("This cloud run already ended.")?;
+    let cwd = store.workspace_root(&session.project_id, Some(&session_id))?;
+    store.db.execute("DELETE FROM messages WHERE session_id=?1 AND id>?2", rusqlite::params![session_id, cloud.turn_message]).map_err(|e| e.to_string())?;
+    store.db.execute("UPDATE sessions SET status='running',task_stage='in_progress',completed_at=NULL WHERE id=?1", [&session_id]).map_err(|e| e.to_string())?;
+    let config = RunConfig {
+        session_id: session_id.clone(),
+        provider: session.provider,
+        model: session.model,
+        reasoning_effort: session.reasoning_effort,
+        mode: session.mode,
+        cwd,
+        resume_id: session.resume_id,
+        prompt: String::new(),
+        instructions: String::new(),
+        images: Vec::new(),
+        skill: None,
+        goal: None,
+        codex_settings: session.codex_settings,
+    };
+    let agent = RunningAgent::new(tx, stopped);
+    let prepared = PreparedRun {
+        config,
+        restore_stage: None,
+        turn_message_id: cloud.turn_message,
+        turn_started: std::time::Instant::now(),
+        context_handoff: None,
+        run_id: agent.run_id.clone(),
+        pending_approvals: agent.approvals.clone(),
+        pending_requests: agent.pending_requests.clone(),
+        subagents: agent.subagents.clone(),
+        assistant: agent.assistant.clone(),
+        last_event: agent.last_event.clone(),
+        team: None,
+    };
+    agents.insert(session_id, agent);
+    Ok(prepared)
+}
+
+/// Starts a run that re-attaches to a cloud task's remote run (`cloud_agents::resume`).
+pub(crate) async fn attach_cloud_run(app: tauri::AppHandle, session_id: String) -> Result<()> {
+    let state = app.state::<AppState>();
+    launch_operation_admitted(
+        app.clone(),
+        state,
+        session_id,
+        None,
+        None,
+        OperationAdmission {
+            expected_project: None,
+            goal: None,
+            team: None,
+            cloud_attach: true,
+        },
+    )
+    .await
 }
 
 async fn launch_task(
@@ -1453,6 +1610,7 @@ async fn launch_operation(
             expected_project,
             goal,
             team: None,
+            cloud_attach: false,
         },
     )
     .await
@@ -1476,6 +1634,7 @@ pub(crate) fn launch_team_task<'a>(
             expected_project: None,
             goal: None,
             team: Some(admission),
+            cloud_attach: false,
         },
     ))
 }
@@ -1484,6 +1643,7 @@ struct OperationAdmission {
     expected_project: Option<String>,
     goal: Option<task_controls::GoalLaunch>,
     team: Option<architect::Admission>,
+    cloud_attach: bool,
 }
 
 async fn launch_operation_admitted(
@@ -1498,11 +1658,12 @@ async fn launch_operation_admitted(
         expected_project,
         goal,
         team: team_admission,
+        cloud_attach,
     } = admission;
     if state.shutdown.load(Ordering::SeqCst) != 0 {
         return Err("PandaCode is shutting down.".into());
     }
-    let command = if goal.is_none() && team_admission.is_none() {
+    let command = if goal.is_none() && team_admission.is_none() && !cloud_attach {
         prepare_command(&state, &session_id, text.as_deref()).await?
     } else {
         None
@@ -1545,6 +1706,7 @@ async fn launch_operation_admitted(
         context_handoff,
         run_id,
         pending_approvals,
+        pending_requests,
         subagents,
         assistant,
         last_event,
@@ -1561,9 +1723,14 @@ async fn launch_operation_admitted(
             command,
             goal: goal_request,
             team: team_admission,
+            cloud_attach,
         },
     )?;
+    // A cloud task's agent runs on its machine (cloud_agents::transport). Quitting must
+    // leave that run alone, so this run neither stops it nor records an end while closing.
+    let cloud = cloud_agents::transport::is_cloud(&session_id);
     let _ = app.emit("agent-event", event(&session_id, "status", "running"));
+    tray::refresh(&app);
     let store = state.store.clone();
     let agents = state.agents.clone();
     // Optional metadata must never block a conversation when its storage cannot
@@ -1624,12 +1791,16 @@ async fn launch_operation_admitted(
         let assistant_sink = assistant.clone();
         let store_sink = store.clone();
         let app_sink = app.clone();
+        let pending_requests_sink = pending_requests.clone();
         let subagents_sink = subagents.clone();
         let goal_reply_sink = goal_reply.clone();
         let goal_agents_sink = agents.clone();
         let native_turn_sink = Mutex::new(String::new());
         let team_sink = team.clone();
         let sink: providers::Sink = Arc::new(move |mut e: AgentEvent| {
+            if cloud && app_sink.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
+                return;
+            }
             last_event.store(storage::now(), Ordering::SeqCst);
             if e.kind == "done" {
                 return;
@@ -1687,11 +1858,12 @@ async fn launch_operation_admitted(
                     e.kind.as_str(),
                     "approval" | "approval_cancelled" | "input_request" | "input_cancelled"
                 ) {
-                    let saved = save_approval(&store_sink, &pending_approvals, &run_id, &mut e);
+                    let saved = save_approval_with_pending(&store_sink, &pending_approvals, Some(&pending_requests_sink), &run_id, &mut e);
                     if saved.is_ok() && e.kind == "approval" {
                         if let Some(request_id) = &e.request_id {
                             bots::approval_requested(&app_sink, &e.session_id, request_id, &e.text);
                         }
+                        tray::refresh(&app_sink);
                     }
                     saved
                 } else {
@@ -1785,7 +1957,7 @@ async fn launch_operation_admitted(
         // Team workers rarely get a follow-up, and their warm agents would push out the
         // architect's, whose review turn starts as soon as they settle.
         let managed_worker = team.as_ref().is_some_and(|admission| admission.parent != session_id);
-        let warm_next = (providers::warms(&config) && !managed_worker).then(|| {
+        let warm_next = (providers::warms(&config) && !managed_worker && !cloud).then(|| {
             let tools = host.as_ref().map(|host| (host.tools.clone(), host.approval_tools.clone())).unwrap_or_default();
             (config.clone(), tools)
         });
@@ -1799,6 +1971,13 @@ async fn launch_operation_admitted(
         } else {
             providers::run_with_tools(config, sink, rx, host).await
         };
+        if cloud && app.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
+            // The remote run continues; the next launch re-attaches to it.
+            if let Ok(mut registry) = agents.lock() {
+                registry.remove(&session_id);
+            }
+            return;
+        }
         if let Ok(mut slot) = goal_reply.lock() {
             if let Some(reply) = slot.take() {
                 let _ =
@@ -1826,6 +2005,22 @@ async fn launch_operation_admitted(
             .await
             {
                 persist_turn_changes(&app, &store, &session_id, capture);
+            }
+        }
+        if cloud {
+            // The run's messages are saved; now its changes come back, before the turn ends,
+            // so a queued follow-up starts from them. Until that is done the run stays
+            // re-attachable (its run ID is kept), so a quit or an outage loses nothing.
+            let (cloud_app, cloud_id) = (app.clone(), session_id.clone());
+            if let Err(error) = blocking(move || cloud_agents::tasks::after_run(&cloud_app, &cloud_id)).await {
+                eprintln!("Cloud agents: could not finish a cloud run yet: {error}");
+            }
+            let unfinished = store.lock().ok().and_then(|db| cloud_agents::load(&db, &session_id).ok().flatten()).is_some_and(|cloud| cloud.active());
+            if unfinished && app.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
+                if let Ok(mut registry) = agents.lock() {
+                    registry.remove(&session_id);
+                }
+                return;
             }
         }
         // Match the registry -> store lock order used for Start and Stop. Stop
@@ -1945,6 +2140,14 @@ async fn launch_operation_admitted(
             }
         }
         if let Some(registry) = registry.as_mut() {
+            if let Some(agent) = registry.get(&session_id) {
+                if let Ok(mut approvals) = agent.approvals.lock() {
+                    approvals.clear();
+                }
+                if let Ok(mut pending) = agent.pending_requests.lock() {
+                    pending.clear();
+                }
+            }
             registry.remove(&session_id);
         }
         let done = if was_stopped {
@@ -1954,6 +2157,8 @@ async fn launch_operation_admitted(
         } else {
             "Turn failed"
         };
+        // Before `done`, so the window's tray_seen for the open task lands after it.
+        tray::finished(&app, &session_id, was_stopped, successful);
         let _ = app.emit("agent-event", event(&session_id, "done", done));
         remote::run_finished(&app, &session_id, successful, was_stopped, done);
         // Bot conversations reply on their channel and send their next queued message.
@@ -2011,6 +2216,9 @@ async fn stop_session(
         architect::architect_control(app, state, session_id, "stop".into()).await?;
         return Ok(());
     }
+    if cloud_agents::transport::is_cloud(&session_id) {
+        cloud_agents::tasks::stop_run(&app, &session_id);
+    }
     if let Some(tx) = state
         .agents
         .lock()
@@ -2052,6 +2260,7 @@ pub(crate) async fn local_providers(force: bool) -> Vec<providers::ProviderInfo>
     if force {
         providers::acp_catalog::invalidate("antigravity");
         providers::acp_catalog::invalidate("grok");
+        providers::acp_catalog::invalidate("devin");
     }
     tauri::async_runtime::spawn_blocking(providers::discover)
         .await
@@ -2109,10 +2318,22 @@ async fn respond_user_input(
     };
     // Keep the form pending until the protocol validates the answer. An enqueue
     // acknowledgement alone could discard a rejected answer during streaming.
-    tokio::time::timeout(std::time::Duration::from_secs(15), reply)
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(15), reply)
         .await
         .map_err(|_| "The agent did not acknowledge the answer. Try again.".to_owned())?
-        .map_err(|_| "The agent stopped before accepting the answer.".to_owned())?
+        .map_err(|_| "The agent stopped before accepting the answer.".to_owned())?;
+    accepted?;
+    let agents = state.agents.lock().map_err(|e| e.to_string())?;
+    if let Some(agent) = agents.get(&session_id) {
+        let mut approvals = agent.approvals.lock().map_err(|e| e.to_string())?;
+        let mut pending_requests = agent.pending_requests.lock().map_err(|e| e.to_string())?;
+        remove_pending_request(&mut approvals, Some(&mut pending_requests), &request_id);
+        state.store.lock().map_err(|e| e.to_string())?.status(
+            &session_id,
+            if approvals.is_empty() { "running" } else { "waiting" },
+        )?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2171,6 +2392,54 @@ async fn open_external_url(url: String) -> Result<()> {
     } else {
         Err("Could not open the browser.".into())
     }
+}
+
+/// A sent attachment outside the task's workspace, shown in the file manager. It is only
+/// revealed (selected), never opened, so nothing in it runs.
+#[tauri::command]
+async fn reveal_path(path: String) -> Result<()> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() || std::fs::symlink_metadata(&path).is_err() {
+        return Err("This attachment is no longer on this computer.".into());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/usr/bin/open");
+        command.arg("-R").arg(&path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let folder = if path.is_dir() { path.clone() } else { path.parent().map(PathBuf::from).unwrap_or_else(|| path.clone()) };
+        let mut command = tokio::process::Command::new("xdg-open");
+        child_env::sanitize(&mut command);
+        command.arg(folder);
+        command
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // Explorer reports failure even when it showed the item, so only a launch error counts.
+    tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
+        .await
+        .map_err(|_| "Showing the attachment timed out.")?
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A sent image or screenshot from the shared capture registry, for the transcript's chips.
+#[tauri::command]
+async fn prompt_image(app: tauri::AppHandle, id: String) -> Result<Option<String>> {
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("browser-captures");
+    blocking(move || prompt_attachments::image_data_url(&dir, &id)).await
 }
 
 #[tauri::command]
@@ -2776,11 +3045,34 @@ async fn read_file(
     let root = state.root(&project_id, session_id.as_deref())?;
     blocking(move || workspace::read_file(&root, path)).await
 }
+/// A PDF, Word, spreadsheet or image file for the file viewer, sent as raw bytes rather than JSON.
 #[tauri::command]
-async fn workspace_image(state: State<'_, AppState>, session_id: String, path: String) -> Result<String> {
+async fn read_document_file(
+    state: State<'_, AppState>,
+    project_id: String,
+    session_id: Option<String>,
+    path: String,
+) -> Result<tauri::ipc::Response> {
+    let root = state.root(&project_id, session_id.as_deref())?;
+    blocking(move || workspace::read_document_bytes(&root, &path)).await.map(tauri::ipc::Response::new)
+}
+#[tauri::command]
+async fn workspace_image(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    path: String,
+) -> Result<String> {
     // A question belongs to one task: its images come from that task's checkout only.
-    let project_id = state.store.lock().map_err(|e| e.to_string())?.session(&session_id)?.project_id;
-    let root = state.root(&project_id, Some(&session_id))?;
+    // The file viewer passes the same project and task it read the document with.
+    let project_id = match project_id {
+        Some(id) => id,
+        None => {
+            let session_id = session_id.as_deref().ok_or_else(|| "A task is required to show images".to_string())?;
+            state.store.lock().map_err(|e| e.to_string())?.session(session_id)?.project_id
+        }
+    };
+    let root = state.root(&project_id, session_id.as_deref())?;
     blocking(move || workspace::image_data_url(&root, &path)).await
 }
 #[tauri::command]
@@ -3012,6 +3304,10 @@ pub fn run() {
         std::process::exit(local_signing::cli());
     }
     let app = tauri::Builder::default()
+        // First, as its docs require: a second launch focuses this window instead of opening another.
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            tray::show(app)
+        }))
         .plugin(tauri_plugin_dialog::init())
         // Updates come only from GitHub Releases, verified against the public key in tauri.conf.json.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -3028,6 +3324,7 @@ pub fn run() {
             }
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            secret_store::setup(&dir);
             provider_settings::setup(&dir).map_err(std::io::Error::other)?;
             connections::setup(&dir).map_err(std::io::Error::other)?;
             // Optional integration storage must never prevent the workspace from opening.
@@ -3046,6 +3343,7 @@ pub fn run() {
                 terminals: Arc::new(Mutex::new(HashMap::new())),
                 shutdown: AtomicU8::new(0),
             });
+            cloud_agents::init(app.handle());
             overlay::setup(app.handle(), &dir).map_err(std::io::Error::other)?;
             remote::setup(app.handle(), &dir);
             app.manage(browser::BrowserState::default());
@@ -3057,6 +3355,9 @@ pub fn run() {
             app.manage(architect::Runtime::default());
             architect::watchdog::watch(app.handle().clone());
             bots::start(app.handle());
+            if let Err(error) = tray::setup(app.handle()) {
+                eprintln!("Menu bar item is unavailable: {error}");
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -3104,6 +3405,18 @@ pub fn run() {
                 ];
                 return handler(invoke);
             }
+            if invoke.message.webview_ref().label() == "tray" {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+                    tray::tray_snapshot,
+                    tray::tray_open,
+                    tray::tray_refresh_usage,
+                    tray::tray_show_app,
+                    tray::tray_hide,
+                    tray::tray_quit,
+                    tray::tray_resize,
+                ];
+                return handler(invoke);
+            }
             if invoke.message.webview_ref().label() != "main" {
                 invoke
                     .resolver
@@ -3114,6 +3427,7 @@ pub fn run() {
                 support::open_support,
                 support::support_details,
                 local_sign_app,
+                app_updates::app_update_install_supported,
                 agent_updates::check_agent_updates,
                 agent_updates::update_agent,
                 moodboards::list_moodboards,
@@ -3145,9 +3459,12 @@ pub fn run() {
                 remote::remote_set_host_enabled,
                 remote::remote_devices,
                 remote::remote_revoke_device,
-                remote::remote_set_trusted,
                 remote::remote_targets,
                 remote::mirror::remote_start_task,
+                cloud_agents::tasks::cloud_agent_targets,
+                cloud_agents::tasks::cloud_agent_start,
+                cloud_agents::tasks::cloud_agent_action,
+                cloud_agents::tasks::cloud_agent_set_claude_token,
                 remote::mirror::remote_repo_check,
                 provider_settings::provider_configuration,
                 connections::connections_list,
@@ -3155,6 +3472,7 @@ pub fn run() {
                 connections::connection_delete,
                 connections::connection_assign,
                 agent_usage::agent_usage,
+                tray::tray_seen,
                 usage_ledger::usage_ledger,
                 capabilities::capabilities_inventory,
                 capabilities::cache_alignment,
@@ -3183,6 +3501,7 @@ pub fn run() {
                 bots::bot_activity,
                 bots::bot_project_ids,
                 bots::bot_message,
+                bots::bot_set_capabilities, bots::bot_assign_task, bots::bot_task_links, bots::bot_task_brief,
                 bots::schedule::bot_schedule_create,
                 bots::schedule::bot_schedule_set_enabled,
                 bots::schedule::bot_schedule_delete,
@@ -3214,6 +3533,7 @@ pub fn run() {
                 provider_settings::provider_remove_commandcode_key,
                 provider_settings::provider_set_mimo_endpoint,
                 architect::profiles::architect_profiles,
+                architect::profiles::architect_set_lead_guidance,
                 architect::profiles::architect_save_profile,
                 architect::profiles::architect_delete_profile,
                 architect::architect_get,
@@ -3335,6 +3655,8 @@ pub fn run() {
                 cloud::commands::cloud_connect,
                 cloud::commands::cloud_disconnect,
                 cloud::commands::cloud_setup_sandboxes,
+                cloud::commands::cloud_instabox_images,
+                cloud::commands::cloud_instabox_set_image,
                 cloud::commands::cloud_machines,
                 cloud::commands::cloud_create,
                 cloud::commands::cloud_power,
@@ -3354,14 +3676,23 @@ pub fn run() {
                 skills::skills_matrix,
                 skills::skills_scan,
                 skills::skills_remove,
+                skills::skills_catalogs,
+                skills::skills_catalog_add,
+                skills::skills_catalog_refresh,
+                skills::skills_catalog_state,
+                skills::skills_catalog_import,
+                skills::skills_discover,
                 set_task_link,
                 import_prompt_image,
+                prompt_image,
+                reveal_path,
                 read_document,
                 describe_folder,
                 list_files,
                 search_files,
                 search_text,
                 read_file,
+                read_document_file,
                 design::design_list,
                 design::design_read,
                 design::design_comments,
@@ -3383,6 +3714,7 @@ pub fn run() {
                 list_local_servers,
                 jev::jev_configuration,
                 jev::jev_save_configuration,
+                jev::jev_decision_models,
                 jev::jev_doctor,
                 jev::jev_install_runtime,
                 jev::jev_start,
@@ -3417,8 +3749,10 @@ pub fn run() {
             }
             jev::shutdown();
             app.state::<file_preview::FilePreviews>().shutdown();
+            // Cloud runs keep going on their machines; their bridges are killed below.
+            let cloud: HashSet<String> = state.store.lock().ok().and_then(|store| cloud_agents::active_runs(&store).ok()).unwrap_or_default().into_iter().collect();
             if let Ok(agents) = state.agents.lock() {
-                for tx in agents.values() {
+                for (_, tx) in agents.iter().filter(|(id, _)| !cloud.contains(*id)) {
                     let _ = tx.send(RunInput::Stop);
                 }
             }
@@ -3430,7 +3764,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
                 while tokio::time::Instant::now() < deadline {
-                    if agents.lock().map(|a| a.is_empty()).unwrap_or(true) {
+                    if agents.lock().map(|a| a.keys().all(|id| cloud.contains(id))).unwrap_or(true) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

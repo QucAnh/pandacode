@@ -8,12 +8,13 @@ mod config;
 mod crypto;
 mod host;
 pub(crate) mod mirror;
+mod secrets;
 mod socket;
 mod start;
 
 pub(crate) use mirror::{route, Mirror};
 
-use crate::{secret_store, Result};
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -43,12 +44,11 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    fn view(&self, me: &str, settings: &config::Settings) -> Value {
+    fn view(&self, me: &str) -> Value {
         json!({
             "id": self.id, "name": self.name, "platform": self.platform,
             "fingerprint": crypto::fingerprint(&self.public_key),
             "host": self.host, "online": self.online, "lastSeen": self.last_seen, "current": self.id == me,
-            "trusted": settings.is_trusted(&self.id, &self.public_key),
         })
     }
 }
@@ -57,7 +57,7 @@ type Reply = tokio::sync::oneshot::Sender<Result<Value>>;
 
 const UNKNOWN_DEVICE: &str = "That computer is not on this account.";
 
-/// A trusted device mirroring some of this computer's tasks, and the events waiting
+/// A device mirroring some of this computer's tasks, and the events waiting
 /// for its next frame.
 #[derive(Default)]
 pub(crate) struct Subscriber {
@@ -71,8 +71,6 @@ pub(crate) struct Subscriber {
 pub(crate) struct Inner {
     settings: config::Settings,
     token: Option<String>,
-    /// Signed in, but the keychain refused the token read at startup; retried in the background.
-    unreadable: bool,
     connected: bool,
     /// Bumped on every start/stop so an old socket task knows to exit.
     generation: u64,
@@ -87,6 +85,8 @@ pub(crate) struct Inner {
     /// A flush of subscriber events is scheduled.
     flushing: bool,
     replay: host::Replay,
+    /// Nonces of replies and events from hosts, refused when repeated or stale.
+    inbound: host::Replay,
     /// Pair keys: device id → (the public key it was derived from, key).
     keys: HashMap<String, (String, crypto::Key)>,
     flow: Option<auth::Flow>,
@@ -116,13 +116,9 @@ impl Inner {
         }
     }
 
-    /// Calls and task content go only to a device trusted here with its current key.
+    /// Calls and task content go only to a device in the latest account presence list.
     fn callable(&self, device_id: &str) -> Result<()> {
-        let device = self.devices.iter().find(|d| d.id == device_id).ok_or(UNKNOWN_DEVICE)?;
-        if !self.settings.is_trusted(device_id, &device.public_key) {
-            let name = if device.name.is_empty() { "That computer" } else { &device.name };
-            return Err(format!("{name} isn't trusted on this computer yet. Trust it in Settings → Remote access."));
-        }
+        self.devices.iter().find(|d| d.id == device_id).ok_or(UNKNOWN_DEVICE)?;
         Ok(())
     }
 
@@ -137,7 +133,6 @@ impl Inner {
         self.connected = false;
         self.fail_pending(None, "Signed out of PandaCode Connect.");
         self.token = None;
-        self.unreadable = false;
         self.settings.account = None;
         self.devices.clear();
         self.presence = false;
@@ -149,9 +144,8 @@ impl Inner {
 
 pub(crate) struct Remote {
     dir: PathBuf,
-    accounts: config::Accounts,
     inner: Mutex<Inner>,
-    /// The device key, separate from `inner` so a slow keychain prompt blocks nothing else.
+    /// The device key, separate from `inner` so reading or creating it blocks nothing else.
     key: Mutex<Option<StaticSecret>>,
 }
 
@@ -170,13 +164,13 @@ impl Remote {
         }
     }
 
-    /// The device's X25519 key from the keychain. Never creates one.
+    /// The device's X25519 key from the secrets file. Never creates one.
     fn secret(&self) -> Result<StaticSecret> {
         let mut key = self.key();
         if let Some(secret) = key.as_ref() {
             return Ok(secret.clone());
         }
-        let secret = config::read_key(&self.accounts.key)?.and_then(|text| crypto::decode_secret(&text)).ok_or("This computer has no PandaCode Connect key. Sign in again.")?;
+        let secret = secrets::read(&self.dir).key.and_then(|text| crypto::decode_secret(&text)).ok_or("This computer has no PandaCode Connect key. Sign in again.")?;
         *key = Some(secret.clone());
         Ok(secret)
     }
@@ -187,7 +181,7 @@ impl Remote {
         if let Some(secret) = key.as_ref() {
             return Ok(secret.clone());
         }
-        let secret = config::load_or_create_key(config::read_key(&self.accounts.key), |text| secret_store::set(config::SERVICE, &self.accounts.key, text))?;
+        let secret = config::load_or_create_key(secrets::read(&self.dir).key, |text| secrets::set_key(&self.dir, text))?;
         *key = Some(secret.clone());
         Ok(secret)
     }
@@ -203,9 +197,10 @@ impl Remote {
         let inner = self.lock();
         let mut status = json!({
             "configured": config::build().is_some(),
-            "signedIn": inner.token.is_some() || inner.unreadable,
+            "signedIn": inner.token.is_some(),
             "device": {"id": inner.settings.device_id, "name": config::device_name(), "fingerprint": fingerprint},
             "hostEnabled": inner.settings.host_enabled,
+            "remoteFullAccess": inner.settings.remote_full_access,
             "connected": inner.connected,
         });
         if let Some(account) = &inner.settings.account {
@@ -216,7 +211,7 @@ impl Remote {
 
     fn devices_view(&self) -> Vec<Value> {
         let inner = self.lock();
-        inner.devices.iter().map(|device| device.view(&inner.settings.device_id, &inner.settings)).collect()
+        inner.devices.iter().map(|device| device.view(&inner.settings.device_id)).collect()
     }
 }
 
@@ -235,80 +230,13 @@ fn emit_presence(app: &tauri::AppHandle) {
 /// Loads settings and starts the socket when already signed in. No network otherwise.
 pub(crate) fn setup(app: &tauri::AppHandle, dir: &std::path::Path) {
     let settings = config::load(dir);
-    let accounts = config::accounts(dir);
-    // Only a signed-in computer reads the keychain at startup.
-    let (startup, key) = if settings.account.is_some() { signed_in_start(dir, &accounts, &settings.device_id) } else { (config::Startup::SignedOut, None) };
-    let unreadable = startup == config::Startup::Unreadable;
-    let token = match startup {
-        config::Startup::SignedIn(token) => Some(token),
-        _ => None,
-    };
+    // Only a signed-in computer reads the secrets file; an expired token means signed out.
+    let now = chrono::Utc::now().timestamp();
+    let token = if settings.account.is_some() { secrets::read(dir).token.filter(|token| config::token_valid(token, now)) } else { None };
     let signed_in = token.is_some();
-    app.manage(Remote { dir: dir.to_owned(), accounts, inner: Mutex::new(Inner { settings, token, unreadable, ..Default::default() }), key: Mutex::new(key) });
+    app.manage(Remote { dir: dir.to_owned(), inner: Mutex::new(Inner { settings, token, ..Default::default() }), key: Mutex::new(None) });
     if signed_in && config::build().is_some() {
         socket::start(app);
-    }
-    if unreadable {
-        tauri::async_runtime::spawn(retry_token(app.clone()));
-    }
-}
-
-/// Reads the token, first adopting the pre-0.3.20 unscoped items once (one attempt per
-/// launch) when the scoped ones are missing. Returns the adopted key so it is used even if
-/// writing it failed.
-fn signed_in_start(dir: &std::path::Path, accounts: &config::Accounts, device_id: &str) -> (config::Startup, Option<StaticSecret>) {
-    let now = chrono::Utc::now().timestamp();
-    let token = config::read_key(&accounts.token);
-    let key = config::read_key(&accounts.key);
-    let legacy = config::legacy_accounts();
-    let read_legacy = || (config::read_key(&legacy.token).ok().flatten(), config::read_key(&legacy.key).ok().flatten());
-    let Some(adopted) = config::adoption(dir, device_id, now, &token, &key, read_legacy) else { return (config::startup(token, now), None) };
-    let mut saved = secret_store::set(config::SERVICE, &accounts.token, &adopted.token);
-    let secret = adopted.key.as_deref().and_then(crypto::decode_secret);
-    if let Some(text) = &adopted.key {
-        saved = saved.and(secret_store::set(config::SERVICE, &accounts.key, text));
-    }
-    match saved {
-        Ok(()) => {
-            secret_store::remove(config::SERVICE, &legacy.token);
-            secret_store::remove(config::SERVICE, &legacy.key);
-        }
-        Err(error) => eprintln!("Could not move the PandaCode Connect sign-in to this install's Keychain items: {error}"),
-    }
-    (config::Startup::SignedIn(adopted.token), secret)
-}
-
-/// After a keychain error at startup: reads the token again at 5 s, 15 s and 60 s. A token
-/// starts the socket; a real not-found signs out; errors keep the account as it is.
-async fn retry_token(app: tauri::AppHandle) {
-    for wait in [5, 15, 60] {
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-        let state = remote(&app);
-        if !state.lock().unreadable {
-            return;
-        }
-        let startup = config::startup(config::read_key(&state.accounts.token), chrono::Utc::now().timestamp());
-        if startup == config::Startup::Unreadable {
-            continue;
-        }
-        let signed_in = {
-            let mut inner = state.lock();
-            // A sign-in or sign-out meanwhile settled it.
-            if !inner.unreadable {
-                return;
-            }
-            inner.unreadable = false;
-            match startup {
-                config::Startup::SignedIn(token) => inner.token = Some(token),
-                _ => inner.token = None,
-            }
-            inner.token.is_some()
-        };
-        if signed_in && config::build().is_some() {
-            socket::start(&app);
-        }
-        emit_status(&app);
-        return;
     }
 }
 
@@ -323,7 +251,9 @@ fn sign_out_local(app: &tauri::AppHandle, used: Option<&str>) {
         }
         inner.settings.clone()
     };
-    secret_store::remove(config::SERVICE, &remote.accounts.token);
+    if let Err(error) = secrets::remove_token(&remote.dir) {
+        eprintln!("{error}");
+    }
     remote.save(&settings);
     emit_status(app);
     emit_presence(app);
@@ -414,7 +344,7 @@ pub async fn remote_sign_in_finish(app: tauri::AppHandle) -> Result<Value> {
     };
     let device = |id: String| json!({"id": id, "name": config::device_name(), "platform": std::env::consts::OS, "publicKey": public_key});
     let (token, account) = match auth::register(&build, &github_token, device(state.device_id())).await {
-        // This id is registered with another key (a restored keychain, say): become a new device once.
+        // This id is registered with another key (the key file was lost, say): become a new device once.
         Err(error) if error == auth::KEY_CHANGED => {
             let settings = {
                 let mut inner = state.lock();
@@ -429,11 +359,10 @@ pub async fn remote_sign_in_finish(app: tauri::AppHandle) -> Result<Value> {
     if config::parse_token(&token).is_none_or(|claims| claims.dev != state.device_id()) {
         return Err("The relay returned an unexpected sign-in token.".into());
     }
-    secret_store::set(config::SERVICE, &state.accounts.token, &token)?;
+    secrets::set_token(&state.dir, &token)?;
     let settings = {
         let mut inner = state.lock();
         inner.token = Some(token);
-        inner.unreadable = false;
         inner.settings.account = Some(account);
         inner.settings.clone()
     };
@@ -458,17 +387,23 @@ pub async fn remote_sign_out(app: tauri::AppHandle) -> Result<Value> {
     Ok(remote(&app).status())
 }
 
+/// Sets "Allow remote control" and/or "Full access for remote tasks"; either may be omitted.
 #[tauri::command]
-pub async fn remote_set_host_enabled(app: tauri::AppHandle, enabled: bool) -> Result<Value> {
+pub async fn remote_set_host_enabled(app: tauri::AppHandle, enabled: Option<bool>, full_access: Option<bool>) -> Result<Value> {
     let state = remote(&app);
     let settings = {
         let mut inner = state.lock();
-        inner.settings.host_enabled = enabled;
-        if !enabled {
-            inner.subscribers.clear();
+        if let Some(full_access) = full_access {
+            inner.settings.remote_full_access = full_access;
         }
-        if let Some(outbox) = &inner.outbox {
-            let _ = outbox.send(json!({"kind": "host", "enabled": enabled}).to_string());
+        if let Some(enabled) = enabled {
+            inner.settings.host_enabled = enabled;
+            if !enabled {
+                inner.subscribers.clear();
+            }
+            if let Some(outbox) = &inner.outbox {
+                let _ = outbox.send(json!({"kind": "host", "enabled": enabled}).to_string());
+            }
         }
         inner.settings.clone()
     };
@@ -484,35 +419,6 @@ pub async fn remote_devices(app: tauri::AppHandle) -> Result<Vec<Value>> {
         socket::refresh_devices(&app).await?;
     }
     Ok(remote(&app).devices_view())
-}
-
-/// Pins (or forgets) a device's current public key, for both directions: only trusted
-/// devices may drive this one, and this one calls only trusted hosts.
-#[tauri::command]
-pub async fn remote_set_trusted(app: tauri::AppHandle, device_id: String, trusted: bool) -> Result<Vec<Value>> {
-    valid_device_id(&device_id)?;
-    if trusted && !remote(&app).lock().presence {
-        socket::refresh_devices(&app).await?;
-    }
-    let state = remote(&app);
-    let settings = {
-        let mut inner = state.lock();
-        if device_id == inner.settings.device_id {
-            return Err("That is this computer.".into());
-        }
-        if trusted {
-            let key = inner.devices.iter().find(|d| d.id == device_id).map(|d| d.public_key.clone()).filter(|key| !crypto::fingerprint(key).is_empty()).ok_or(UNKNOWN_DEVICE)?;
-            inner.settings.trusted.insert(device_id, key);
-        } else {
-            inner.settings.trusted.remove(&device_id);
-            inner.subscribers.remove(&device_id);
-            inner.catalog.forget(&device_id);
-        }
-        inner.settings.clone()
-    };
-    state.save(&settings);
-    emit_presence(&app);
-    Ok(state.devices_view())
 }
 
 #[tauri::command]
@@ -539,7 +445,6 @@ pub async fn remote_revoke_device(app: tauri::AppHandle, device_id: String) -> R
             inner.subscribers.remove(&device_id);
             inner.keys.remove(&device_id);
             inner.catalog.forget(&device_id);
-            inner.settings.trusted.remove(&device_id);
             let settings = inner.settings.clone();
             drop(inner);
             state.save(&settings);
@@ -549,8 +454,7 @@ pub async fn remote_revoke_device(app: tauri::AppHandle, device_id: String) -> R
     Ok(json!({}))
 }
 
-/// Computers a task can run on: trusted here (and so, symmetrically, trusting this one)
-/// with hosting on.
+/// Other online account devices with remote control enabled.
 #[tauri::command]
 pub async fn remote_targets(app: tauri::AppHandle) -> Vec<Value> {
     let state = remote(&app);
@@ -562,7 +466,7 @@ fn targets(inner: &Inner) -> Vec<Value> {
     inner
         .devices
         .iter()
-        .filter(|d| d.id != inner.settings.device_id && d.host && inner.settings.is_trusted(&d.id, &d.public_key))
+        .filter(|d| d.id != inner.settings.device_id && d.host && d.online)
         .map(|d| json!({"deviceId": d.id, "name": d.name, "platform": d.platform, "online": d.online}))
         .collect()
 }
@@ -598,30 +502,26 @@ mod tests {
     }
 
     #[test]
-    fn the_viewer_refuses_hosts_it_does_not_trust() {
-        let (old, new) = (crypto::public_key(&crypto::generate()), crypto::public_key(&crypto::generate()));
-        let mut inner = Inner { devices: vec![device("host", "Studio Mac", &new)], ..Default::default() };
-        let refused = Err("Studio Mac isn't trusted on this computer yet. Trust it in Settings → Remote access.".to_string());
-        assert_eq!(inner.callable("host"), refused);
-        // Pinned to an older key: still refused.
-        inner.settings.trusted.insert("host".into(), old);
-        assert_eq!(inner.callable("host"), refused);
-        inner.settings.trusted.insert("host".into(), new);
+    fn listed_hosts_are_callable_without_a_pin() {
+        let key = crypto::public_key(&crypto::generate());
+        let inner = Inner { devices: vec![device("host", "Studio Mac", &key)], ..Default::default() };
         assert_eq!(inner.callable("host"), Ok(()));
         assert_eq!(inner.callable("gone"), Err(UNKNOWN_DEVICE.to_string()));
     }
 
     #[test]
-    fn targets_are_trusted_hosts_other_than_this_one() {
+    fn targets_are_every_online_host_other_than_this_one() {
         let key = crypto::public_key(&crypto::generate());
         let mut guest = device("guest", "Laptop", &key);
         guest.host = false;
-        let mut inner = Inner { devices: vec![device("me", "This Mac", &key), device("studio", "Studio Mac", &key), device("stranger", "Other", &key), guest], ..Default::default() };
+        let mut offline = device("offline", "Offline Mac", &key);
+        offline.online = false;
+        let mut inner = Inner { devices: vec![device("me", "This Mac", &key), device("studio", "Studio Mac", &key), device("other", "Other", &key), offline, guest], ..Default::default() };
         inner.settings.device_id = "me".into();
-        for id in ["me", "studio", "guest"] {
-            inner.settings.trusted.insert(id.into(), key.clone());
-        }
-        assert_eq!(targets(&inner), vec![json!({"deviceId": "studio", "name": "Studio Mac", "platform": "", "online": true})]);
+        assert_eq!(targets(&inner), vec![
+            json!({"deviceId": "studio", "name": "Studio Mac", "platform": "", "online": true}),
+            json!({"deviceId": "other", "name": "Other", "platform": "", "online": true}),
+        ]);
     }
 
     #[test]

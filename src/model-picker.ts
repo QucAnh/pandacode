@@ -1,5 +1,5 @@
 import type { ContextUsage, Provider, ProviderId, ProviderModel } from './types';
-import { fallbackModel, modelChoices, tokenCount } from './model-catalog';
+import { advertisedModelsOnly, fallbackModel, modelChoices, tokenCount } from './model-catalog';
 import { escape, icon } from './dom';
 import { providerLogo } from './provider-logos';
 import { showPopover, hidePopover } from './popover-motion';
@@ -48,7 +48,7 @@ const optionKey = (button: HTMLElement) => `${button.dataset.connection ?? ''}|$
 export function openModelPicker(options: ModelPickerOptions): () => void {
   const { anchor, current, canSwitchProvider, onSelect, onEffortSelect, loadModels, onClose } = options;
   let providers = options.providers.map(provider => ({ ...provider, models: [...provider.models] }));
-  const catalogErrors = new Set<ProviderId>();
+  const catalogErrors = new Map<ProviderId, string>();
   const catalogLoading = new Set<ProviderId>();
   const particles = Array.from({ length: 12 }, (_, i) => `<i style="left:${4 + i * 8}%;top:${18 + i * 29 % 58}%;--drift-duration:${2.2 + i % 4 * .4}s;--drift-delay:${-i * .37}s"></i>`).join('');
   const panel = document.createElement('section');
@@ -261,14 +261,15 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
     const teamMarkup = teams.length ? `<section class="model-menu-group" aria-label="Agent teams"><div class="model-menu-group-heading"><h3>${icon('worktree')}Agent teams</h3></div>${teams.map(team => `<button type="button" class="model-menu-option model-menu-team${team.selected ? ' model-menu-current' : ''}" data-team="${escape(team.id)}" data-provider="team" data-model="${escape(team.id)}" data-available="true" aria-label="${escape(`Agent team · ${team.name}`)}" title="${escape(team.detail)}" ${team.selected ? 'aria-current="true"' : ''}>${providerLogo(team.provider)}<span class="model-menu-option-label"><span>${escape(team.name)}</span><span class="model-menu-description">${escape(team.detail)}</span></span>${team.selected ? icon('check') : ''}</button>`).join('')}</section>` : '';
     const connections = options.connections ?? [];
     const currentConnection = options.currentConnection ?? null;
-    let markup = teamMarkup + providers.flatMap(provider => [null, ...connections.filter(c => c.provider === provider.id)].map(connection => ({ provider, connection }))).map(({ provider, connection }) => {
+    // Uninstalled harnesses stay out of the picker unless the task already uses one.
+    let markup = teamMarkup + providers.filter(provider => provider.installed || provider.id === current.provider).flatMap(provider => [null, ...connections.filter(c => c.provider === provider.id)].map(connection => ({ provider, connection }))).map(({ provider, connection }) => {
       const groupName = connection?.name ?? provider.name;
       const models = modelChoices(provider.id, provider.models, provider.id === current.provider ? current.model : '');
       const providerMatches = [provider.id, provider.name, groupName].some(name => name.toLowerCase().includes(normalized));
       const visible = query ? models.filter(model => providerMatches || [model.id, model.name, model.description].some(value => value.toLowerCase().includes(normalized))) : shortList(provider.id, models);
       const locked = !canSwitchProvider && provider.id !== current.provider;
       const unavailable = !provider.installed;
-      const custom = provider.id !== 'github-copilot' && Boolean(query && !namedHarness && !models.some(model => [model.id, model.name].some(value => value.toLowerCase() === normalized)) && !locked);
+      const custom = !advertisedModelsOnly(provider.id) && Boolean(query && !namedHarness && !models.some(model => [model.id, model.name].some(value => value.toLowerCase() === normalized)) && !locked);
       if (!visible.length && !custom) return '';
       const disabled = locked || unavailable;
       const row = (model: ProviderModel, isCustom: boolean): string => {
@@ -294,7 +295,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
     }
     list.querySelectorAll<HTMLElement>('[data-catalog-loading]').forEach(status => { status.hidden = !catalogLoading.has(status.dataset.catalogLoading as ProviderId); });
     catalogError.hidden = catalogErrors.size === 0;
-    catalogError.textContent = catalogErrors.size ? `Could not load models for ${providers.filter(provider => catalogErrors.has(provider.id)).map(provider => provider.name).join(', ')}. You can enter model IDs for agents that support custom models.` : '';
+    catalogError.textContent = catalogErrors.size ? `Could not load models for ${providers.filter(provider => catalogErrors.has(provider.id)).map(provider => { const reason = catalogErrors.get(provider.id)?.replace(/\.$/, ''); return reason ? `${provider.name} (${reason})` : provider.name; }).join(', ')}. You can enter model IDs for agents that support custom models.` : '';
     updateControls();
     position();
   }
@@ -437,7 +438,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
       void Promise.resolve().then(() => loadModels(provider.id)).then(models => {
         if (closed) return;
         provider.models = models;
-      }).catch(() => { if (!closed) catalogErrors.add(provider.id); }).finally(() => {
+      }).catch(reason => { if (!closed) catalogErrors.set(provider.id, reason instanceof Error ? reason.message : String(reason ?? '')); }).finally(() => {
         if (closed) return;
         catalogLoading.delete(provider.id);
         renderChoices();
