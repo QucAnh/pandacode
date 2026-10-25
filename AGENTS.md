@@ -50,3 +50,10 @@
 - Turn checks (`src/turn-checks.ts`, `checks.rs`, off by default in Settings → Agents): after a clean turn the app runs the checkout's own fast test/check command with the user's environment, bounded by `run_process`; a failure queues one editable fix message, never a loop, and bot tasks are skipped.
 - Workspace search: the inspector's Search tab (`src/search-panel.ts`) lists file-name matches from the @-mention index and find-in-files results from `search_text` (`workspace::search_text`). Agents' optional `codedb` code search is `code_search.rs`.
 - Browser preview mocks for new IPC commands live in `src/preview.ts` (`previewWorktree`, `previewGithub`); add one for every new command so the Playwright suites can cover it.
+
+## Agent skills
+- Issue tracker: [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md)
+- Triage labels: [docs/agents/triage-labels.md](docs/agents/triage-labels.md)
+- Domain docs: [docs/agents/domain.md](docs/agents/domain.md)
+- Graphify: `graphify-out/` (knowledge graph configured and building)
+
