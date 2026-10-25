@@ -454,6 +454,36 @@ impl Store {
             }
             migration.commit().map_err(|e| e.to_string())?;
         }
+        // Fork and upstream migration numbers can collide: a fork step may have
+        // bumped `user_version` past a step its branch never contained, so a
+        // database can claim the newest version without one of its columns and
+        // every query that names it fails ("no such column"). Add whatever the
+        // newest steps would have added, whatever `user_version` says.
+        for (name, definition) in [
+            ("remote_device", "TEXT"),
+            ("remote_session", "TEXT"),
+            ("remote_synced_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("cloud", "TEXT CHECK(cloud IS NULL OR json_valid(cloud))"),
+            ("todos", "TEXT"),
+        ] {
+            let exists: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1)",
+                    [name],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                db.execute_batch(&format!(
+                    "ALTER TABLE sessions ADD COLUMN {name} {definition};"
+                ))
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_remote ON sessions(remote_device,remote_session) WHERE remote_session IS NOT NULL;",
+        )
+        .map_err(|e| e.to_string())?;
         let recovery = db.transaction().map_err(|e| e.to_string())?;
         // Only rows from before typed coordination existed are eligible for the
         // narrowly scoped legacy display projection. New user copies stay user text.
@@ -2964,6 +2994,41 @@ mod tests {
         // Opening a current database again is a no-op.
         drop(reopened);
         Store::open(&path).unwrap().session(&task_id).unwrap();
+    }
+
+    /// The regression behind "no such column: cloud": a fork migration can bump
+    /// `user_version` past a step its branch never ran, leaving a database at the
+    /// newest version without a column current queries name.
+    #[test]
+    fn a_current_version_database_missing_a_late_column_is_repaired() {
+        let dir = std::env::temp_dir().join(format!("pandacode-drift-{}", id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("drifted.db");
+        let (project_id, task_id) = {
+            let store = Store::open(&path).unwrap();
+            let project = store.add_project(&std::env::temp_dir()).unwrap();
+            let task = store
+                .create_session(&project.id, "claude", "sonnet", "full")
+                .unwrap();
+            // Exactly the state a fork build left behind: newest version, no cloud.
+            store
+                .db
+                .execute_batch("ALTER TABLE sessions DROP COLUMN cloud;")
+                .unwrap();
+            (project.id, task.id)
+        };
+        let reopened = Store::open(&path).unwrap();
+        let has_cloud: bool = reopened
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='cloud')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_cloud);
+        assert_eq!(reopened.sessions().unwrap().len(), 1);
+        assert_eq!(reopened.session(&task_id).unwrap().project_id, project_id);
     }
 
     /// Diagnostic: open a copy of a real database and list its tasks with the current
