@@ -164,6 +164,30 @@ type Result<T> = std::result::Result<T, String>;
 /// database older than this, so the guard reads this constant, never a literal.
 pub const SCHEMA_VERSION: i64 = 30;
 
+/// Durable links let Connect load only attachments belonging to a saved message.
+/// Upstream shipped this as step 30 at the same time this fork shipped the plan
+/// checklist as step 30, so both live in step 30 and the startup guard re-runs
+/// this DDL: a database already at 30 from either branch still gets the table.
+const MESSAGE_ATTACHMENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS message_attachments(
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind='image'),
+    name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    width INTEGER,
+    height INTEGER,
+    bytes INTEGER NOT NULL CHECK(bytes>=0),
+    file TEXT,
+    source TEXT NOT NULL CHECK(source IN ('file','moodboard')),
+    moodboard_id TEXT REFERENCES moodboards(id) ON DELETE CASCADE,
+    moodboard_image_id TEXT REFERENCES moodboard_images(id) ON DELETE CASCADE,
+    PRIMARY KEY(session_id,id),
+    CHECK((source='file' AND file IS NOT NULL AND moodboard_id IS NULL AND moodboard_image_id IS NULL) OR (source='moodboard' AND file IS NULL AND moodboard_id IS NOT NULL AND moodboard_image_id IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS message_attachments_session_id ON message_attachments(session_id,id,message_id);
+  CREATE INDEX IF NOT EXISTS message_attachments_message ON message_attachments(message_id,session_id);";
+
 const SIDEBAR_ORDER: &str = "pinned DESC,sidebar_order IS NULL,sidebar_order,COALESCE(MAX(last_response_at,last_prompt_at),last_response_at,last_prompt_at,created_at) DESC,id";
 
 fn settle_unfinished_tools(db: &Connection, sid: Option<&str>, notice: &str) -> Result<()> {
@@ -450,15 +474,16 @@ impl Store {
                 if !exists {
                     migration.execute_batch("ALTER TABLE sessions ADD COLUMN todos TEXT;").map_err(|e| e.to_string())?;
                 }
+                migration.execute_batch(MESSAGE_ATTACHMENTS_SCHEMA).map_err(|e| e.to_string())?;
                 migration.execute_batch("PRAGMA user_version=30;").map_err(|e| e.to_string())?;
             }
             migration.commit().map_err(|e| e.to_string())?;
         }
         // Fork and upstream migration numbers can collide: a fork step may have
         // bumped `user_version` past a step its branch never contained, so a
-        // database can claim the newest version without one of its columns and
-        // every query that names it fails ("no such column"). Add whatever the
-        // newest steps would have added, whatever `user_version` says.
+        // database can claim the newest version without one of its columns or
+        // tables and every query that names it fails ("no such column"). Add
+        // whatever the newest steps would have added, whatever `user_version` says.
         for (name, definition) in [
             ("remote_device", "TEXT"),
             ("remote_session", "TEXT"),
@@ -484,6 +509,8 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS sessions_remote ON sessions(remote_device,remote_session) WHERE remote_session IS NOT NULL;",
         )
         .map_err(|e| e.to_string())?;
+        db.execute_batch(MESSAGE_ATTACHMENTS_SCHEMA)
+            .map_err(|e| e.to_string())?;
         let recovery = db.transaction().map_err(|e| e.to_string())?;
         // Only rows from before typed coordination existed are eligible for the
         // narrowly scoped legacy display projection. New user copies stay user text.
@@ -3064,6 +3091,34 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(newest, SCHEMA_VERSION, "bump SCHEMA_VERSION with every new migration step");
+    }
+
+    #[test]
+    fn a_fork_database_at_30_still_gains_message_attachments_on_open() {
+        // The fork's step 30 only added `sessions.todos`; upstream's added this
+        // table. A database that already claims 30 must still get the table.
+        let directory = std::env::temp_dir().join(format!("pandacode-attachments-{}", id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("store.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            store.db.execute_batch("DROP TABLE message_attachments;").unwrap();
+            store.db.pragma_update(None, "user_version", 30).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let table: bool = store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attachments')", [], |row| row.get(0)).unwrap();
+        assert!(table, "a database already at 30 must still get message_attachments");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn migration_30_creates_message_attachments_index() {
+        let (store, _) = empty_session();
+        let version: i64 = store.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 30);
+        let table: bool = store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attachments')", [], |row| row.get(0)).unwrap();
+        let index: bool = store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='message_attachments_session_id')", [], |row| row.get(0)).unwrap();
+        assert!(table && index);
     }
 
     #[test]
