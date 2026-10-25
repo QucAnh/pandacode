@@ -35,7 +35,7 @@ jobs:
         run: |
           git remote add upstream https://github.com/aicodeking/pandacode.git
           git fetch upstream main
-          git fetch origin upstream-sync || true
+          git fetch origin main
 
       - name: Merge upstream
         id: merge
@@ -51,27 +51,14 @@ jobs:
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push sync branch
-        if: steps.merge.outputs.result == 'clean'
-        run: git push --force-with-lease origin HEAD:refs/heads/upstream-sync
-
-      - name: Open or update pull request
+      - name: Push to main and tag release
         if: steps.merge.outputs.result == 'clean'
         run: |
-          cat > /tmp/body.md <<'EOF'
-          Automated sync from https://github.com/aicodeking/pandacode.
-
-          Merged cleanly in CI. Review the diff, let CI run, and merge once
-          `cargo test --lib storage` passes: a clean merge can still break
-          schema migrations.
-          EOF
-          number=$(gh pr list --head upstream-sync --base main --state open --json number --jq '.[0].number // empty')
-          if [ -n "$number" ]; then
-            gh pr edit "$number" --body-file /tmp/body.md
-            echo "Updating PR #$number"
-          else
-            gh pr create --base main --head upstream-sync --title "Sync upstream pandacode" --body-file /tmp/body.md
-          fi
+          git push --force-with-lease origin HEAD:refs/heads/main
+          VERSION=$(node -p "require('./package.json').version")
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          echo "Pushed main and tagged v$VERSION"
 
       - name: Open or update conflict issue
         if: steps.merge.outputs.result == 'conflict'
@@ -106,5 +93,5 @@ jobs:
         run: |
           number=$(gh issue list --state open --json number,title --jq '.[] | select(.title == "Upstream sync conflict") | .number' | head -1)
           if [ -n "$number" ]; then
-            gh issue close "$number" --comment "Upstream merges cleanly again; review the sync pull request."
+            gh issue close "$number" --comment "Upstream merges cleanly again; synced to main and released as v$(node -p "require('./package.json').version")."
           fi
