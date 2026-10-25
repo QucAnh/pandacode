@@ -6,7 +6,7 @@ import { botAvatarHtml } from './bot-avatars';
 /* The sidebar's Bots view: a bar at the bottom of the sidebar switches the whole sidebar
  * between tasks and a list of bots, each with its avatar, latest message and time. */
 
-export type SidebarView = 'tasks' | 'bots';
+export type SidebarView = 'tasks' | 'bots' | 'todos';
 export type BotsListContext = { bots: Bot[]; selectedProject: string | undefined; working: (bot: Bot) => boolean };
 
 const VIEW_KEY = 'pandacode.sidebarView';
@@ -15,7 +15,10 @@ const SEEN_KEY = 'pandacode.botsSeen';
 const AVATAR_COLORS = ['#8b5cf6', '#3b82f6', '#22c55e', '#14b8a6', '#f97316', '#ef4444', '#ec4899', '#6366f1', '#eab308', '#06b6d4'];
 
 export function storedSidebarView(): SidebarView {
-  try { return localStorage.getItem(VIEW_KEY) === 'bots' ? 'bots' : 'tasks'; } catch { return 'tasks'; }
+  try {
+    const view = localStorage.getItem(VIEW_KEY);
+    return view === 'bots' || view === 'todos' ? view : 'tasks';
+  } catch { return 'tasks'; }
 }
 export function storeSidebarView(view: SidebarView): void {
   try { localStorage.setItem(VIEW_KEY, view); } catch { /* The view still switches for this session. */ }

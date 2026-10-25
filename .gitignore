@@ -18,3 +18,12 @@ website/.astro/
 *.p8
 *.key
 *.pem
+
+# Local graphify knowledge graph and generated docs
+graphify-out/
+GLOSSARY.md
+docs/adr/
+docs/agents/
+
+# Local dev launcher
+pandacode-run.sh

@@ -10,6 +10,7 @@ export async function subscribe(name: 'jev-run', callback: (event: import('./jev
 export async function subscribe(name: 'jev-frame', callback: (event: import('./jev-live').JevFrame) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-install', callback: (event: { status: string; message: string }) => void): Promise<() => void>;
 export async function subscribe(name: 'sessions-changed', callback: () => void): Promise<() => void>;
+export async function subscribe(name: 'todo-changed', callback: (event: { sessionId: string; todos: import('./todo-card').TodoItem[] }) => void): Promise<() => void>;
 export async function subscribe(name: 'queue-changed', callback: (event: { sessionId: string }) => void): Promise<() => void>;
 export async function subscribe(name: 'bots-changed', callback: () => void): Promise<() => void>;
 export async function subscribe(name: 'bot-notification', callback: (event: { botId: string; text: string }) => void): Promise<() => void>;

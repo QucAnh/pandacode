@@ -10,6 +10,8 @@ import './motion.css';
 import './sidebar-tree.css';
 import './inspector-bar.css';
 import './message-queue.css';
+import { plannedTasks, todoCardsHtml } from './todo-card';
+import './todo-card.css';
 import './usage-limit.css';
 import './document-viewer.css';
 import './tool-trace.css';
@@ -281,7 +283,9 @@ $app.innerHTML = `<div class="workspace">
     <div class="sidebar-projects"><button id="project-filter" class="project-filter" data-action="filter-projects" aria-label="Filter projects" aria-haspopup="dialog" aria-expanded="false"><span data-filter-label>All projects</span>${icon('down')}</button>${button('import-conversations', 'Import conversations', 'download', 'import-trigger')}${button('add-project', 'Open project', 'plus')}</div>
     <div id="navigation" class="navigation"></div>
     <div id="sidebar-note" class="sidebar-note" hidden></div>
+    <section id="sidebar-todos-panel" class="todos-panel" aria-label="Progress"></section>
     <section id="sidebar-bots-panel" class="bots-panel" aria-label="Bots"></section>
+    <div id="sidebar-todos" class="sidebar-todos"></div>
     <div id="sidebar-bots" class="sidebar-bots"></div>
     <div class="sidebar-bottom">${button('support', 'Help & support', 'help', 'support-button', 'id="support-button"')}${button('agent-usage', 'Agent usage', 'activity', '', 'id="agent-usage-button"')}<button data-action="archive-view" id="archive-toggle" title="Archived tasks" aria-label="Archived tasks">${icon('archive')}</button><button data-action="settings" title="Settings (${shortcut(',')})" aria-label="Settings">${icon('settings')}</button><button data-action="toggle-theme" id="theme-toggle" aria-label="Dark mode" aria-pressed="false"></button></div>
   </aside>
@@ -930,6 +934,26 @@ async function adaptPickerToComputer(task: Session, deviceId: string, name: stri
   if (notice) notify(notice);
 }
 
+
+/** The agent's plans for the open project: a bar above Bots that opens the whole sidebar. */
+function renderTodos(): void {
+  const bar = $('#sidebar-todos'), panel = $('#sidebar-todos-panel');
+  if (!bar || !panel) return;
+  const planned = plannedTasks(state.sessions, state.projectId);
+  const hasThread = Boolean(state.projectId && state.sessionId);
+  const open = sidebarView === 'todos';
+  const barHtml = `<button type="button" class="sidebar-todos-bar" data-action="toggle-todos-view" aria-pressed="${open}" title="${open ? 'Back to tasks' : 'Show your plans'}">${icon('check')}<span>Progress</span><small>${planned.length || ''}</small>${icon('chevron')}</button>`;
+  if (bar.innerHTML !== barHtml) bar.innerHTML = barHtml;
+  // No open conversation, no bar: progress belongs to the thread on screen.
+  bar.hidden = !hasThread;
+  const html = hasThread ? planned.length ? todoCardsHtml(state.sessions, state.projectId, id => isRunning(id), id => {
+    const live = state.streams.get(id);
+    return Boolean(live && (live.approvals.size || live.inputs.size));
+  }) : '<p class="todos-panel-empty">No plan yet. An agent posts one with <code>pandacode_plan</code> as it works.</p>' : '';
+  if (panel.innerHTML !== html) panel.innerHTML = html;
+  document.querySelector('.sidebar')?.classList.toggle('todos-view', open && hasThread);
+  if (open && !hasThread) { sidebarView = 'tasks'; storeSidebarView('tasks'); }
+}
 function renderNavigation(): void {
   // Preserve the native drag source while agent updates arrive in the background.
   if (sidebarDragging) return;
@@ -945,6 +969,7 @@ function renderNavigation(): void {
   const sidebarSessions = listedSessions().filter(s => s.archived === state.archived && (state.archived || taskStage(s) !== 'completed') && !botProjects.has(s.projectId));
   const visible = sidebarSessions.filter(s => (!state.projectFilter || s.projectId === state.projectFilter) && s.title.toLowerCase().includes(state.query.toLowerCase()));
   renderBots();
+  renderTodos();
   $('#archive-toggle').classList.toggle('active', state.archived);
   $('#archive-toggle').setAttribute('aria-pressed', String(state.archived));
   const row = (s: Session, inFolder = false, inProject = false): string => {
@@ -3852,7 +3877,7 @@ function renderBots(): void {
   if (list.innerHTML !== html) list.innerHTML = html;
 }
 function setSidebarView(view: SidebarView): void {
-  sidebarView = view; storeSidebarView(view); renderBots();
+  sidebarView = view; storeSidebarView(view); renderBots(); renderTodos();
   if (view === 'bots') document.querySelector<HTMLInputElement>('#sidebar-bots-panel [data-bots-search]')?.focus({ preventScroll: true });
 }
 /** A bot's latest message changed; refresh the list's previews without reloading projects. */
@@ -3964,6 +3989,7 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'bot-task-menu': await showBotTaskMenu(element); break;
     case 'cloud-menu': await showCloudMenu(element); break;
     case 'toggle-bots-view': setSidebarView(sidebarView === 'bots' ? 'tasks' : 'bots'); break;
+    case 'toggle-todos-view': setSidebarView(sidebarView === 'todos' ? 'tasks' : 'todos'); break;
     case 'import-conversations': await showConversationImport(); break;
     case 'agent-updates': await agentUpdates.show(); break;
     case 'goal': case 'jobs': case 'usage': if (session()) await performSlashAction(name, '', session()!); break;
@@ -4142,6 +4168,12 @@ async function boot(): Promise<void> {
   window.addEventListener(TEAM_MODE_EVENT, () => { if (session()) renderComposer(); });
   await subscribe('sessions-deleted', event => removeDeletedSessions(event.sessionIds));
   await subscribe('sessions-changed', () => run(reloadSessions()));
+  // The agent replaced its plan: redraw the sidebar card without reloading the list.
+  await subscribe('todo-changed', payload => {
+    const task = state.sessions.find(s => s.id === payload?.sessionId);
+    if (task && Array.isArray(payload?.todos)) task.todos = payload.todos;
+    renderTodos();
+  });
   // An agent booted or asked to show a simulator: bring the panel forward.
   // An agent started or asked to show a VM: bring the panel forward.
   run(subscribe('vm-changed', event => { if (event && !Array.isArray(event) && event.show) openVm(); void vmPanel?.refresh(); }).then(() => undefined));

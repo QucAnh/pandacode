@@ -31,6 +31,7 @@ mod cloud_agents;
 mod capabilities;
 mod vsix_themes;
 mod token_saver;
+mod todo;
 mod skills;
 mod goal_state;
 #[cfg(test)]
@@ -519,8 +520,11 @@ impl AppState {
 /// Projectless chats have nothing to run, so they skip the run script.
 fn app_instructions(chat: bool) -> String {
     let run = if chat { "" } else { run_script::INSTRUCTIONS };
-    [session_titles::GUIDANCE, run, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat()
+    [session_titles::GUIDANCE, run, turn_changes::instruction(), TODO_LIST, TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat()
 }
+
+/// Agents only fill the sidebar checklist if told that it exists.
+const TODO_LIST: &str = "\n\nSidebar plan, every task: your first action is the pandacode_plan tool with the whole plan, one item active, before any other tool call. It is the only plan the user can see: never use your own todo list, todowrite or todoread for it. Then ask for approval and wait for the go-ahead, showing the plan once in that message. After that resend the full list only when a step changes, with the real statuses and one item active, and never repeat the plan in chat: the sidebar card is the live one. The card is decoration and never changes what you may do.";
 
 /// PandaCode closes the harness when a turn ends, so background waits never come back.
 const TURN_ENDS: &str = "\n\nYour turn ends when you reply, and PandaCode then closes this session's process: background commands, monitors and scheduled wakeups started in this turn never report back. Wait for long-running commands in the foreground (or poll them) before you reply.";
@@ -529,7 +533,7 @@ const TURN_ENDS: &str = "\n\nYour turn ends when you reply, and PandaCode then c
 const RICH_QUESTIONS: &str = "\n\nQuestions you ask through the request_user_input tool, where available, render Markdown in PandaCode: use links, images by workspace path (![alt](relative/path.png)), ```chart blocks with JSON {\"type\":\"bar\"|\"line\"|\"pie\",\"title\",\"labels\":[…],\"series\":[{\"name\",\"values\":[…]}]}, ```svg drawings, or static ```html views when a visual helps the user decide. Remote images show as links; scripts never run.";
 
 /// Replies may carry generative UI blocks that PandaCode draws in the thread.
-const GENERATIVE_UI: &str = "\n\nGenerative UI: when a visual beats prose, a reply may include a ```ui block holding JSON {\"type\":…}; ```chart, ```svg and ```html work too. Types (fields): callout(tone info|success|warning|danger|note,title,body), card(title,body,footer,actions,children), stats(items[{label,value,delta,hint,spark[]}]), table(title,columns[],rows[[…]]), chart(chart bar|line|pie|area|sparkline,title,labels,series[{name,values}]), progress(label,value,max), plan|steps|timeline(title,summary,items[{title,detail,status done|active|pending|error|skipped,time}],actions), checklist(items[{text,done}]), tabs|accordion(items[{label,body,children}]), tree(paths[] or items[{name,status,children}]), diff(file,diff), code(file,language,code), terminal(command,output,exitCode), compare(items[{title,pros,cons,verdict}]), gallery(images[{path,caption}]), actions(buttons[{label,prompt,tone}]), chips|followups(options[{label,prompt}]), or inline :codex-followup[Label]{prompt=\"…\"}, form(title,fields[{name,label,type text|textarea|number|select|checkbox,options}],submit,prompt with {name}), stack|grid(columns,children), custom(html,css,state; data-ui-toggle=\"#id\", data-ui-tab/data-ui-panel, data-ui-set=\"k=v\", data-ui-bind=\"k\", data-ui-prompt). Bodies are Markdown. Buttons and forms only put a prompt in the user's composer; nothing runs, and remote URLs are not loaded. ```mermaid shows as labelled source. For a page that needs scripts, write an HTML file and open it with pandacode_preview_file.";
+const GENERATIVE_UI: &str = "\n\nGenerative UI: when a visual beats prose, a reply may include a ```ui block holding JSON {\"type\":…}; ```chart, ```svg and ```html work too. Never use a ```ui plan/steps/timeline block to restate the task plan after you have asked for its approval: that lives in the sidebar card from pandacode_plan. (At the single approval message, one such block is fine.) Types (fields): callout(tone info|success|warning|danger|note,title,body), card(title,body,footer,actions,children), stats(items[{label,value,delta,hint,spark[]}]), table(title,columns[],rows[[…]]), chart(chart bar|line|pie|area|sparkline,title,labels,series[{name,values}]), progress(label,value,max), plan|steps|timeline(title,summary,items[{title,detail,status done|active|pending|error|skipped,time}],actions), checklist(items[{text,done}]), tabs|accordion(items[{label,body,children}]), tree(paths[] or items[{name,status,children}]), diff(file,diff), code(file,language,code), terminal(command,output,exitCode), compare(items[{title,pros,cons,verdict}]), gallery(images[{path,caption}]), actions(buttons[{label,prompt,tone}]), chips|followups(options[{label,prompt}]), or inline :codex-followup[Label]{prompt=\"…\"}, form(title,fields[{name,label,type text|textarea|number|select|checkbox,options}],submit,prompt with {name}), stack|grid(columns,children), custom(html,css,state; data-ui-toggle=\"#id\", data-ui-tab/data-ui-panel, data-ui-set=\"k=v\", data-ui-bind=\"k\", data-ui-prompt). Bodies are Markdown. Buttons and forms only put a prompt in the user's composer; nothing runs, and remote URLs are not loaded. ```mermaid shows as labelled source. For a page that needs scripts, write an HTML file and open it with pandacode_preview_file.";
 
 /// Harnesses without a system prompt hear the app instructions again every few turns.
 const INSTRUCTION_REMINDER_EVERY: i64 = 8;
@@ -547,7 +551,7 @@ mod instruction_tests {
         assert_eq!(reminded, [1, 9, 17]);
         assert!(!reminder_turn(0));
         let text = app_instructions(false);
-        for part in ["Sidebar titles:", "Run and preview workflow:", "File change tracking:", "Questions you ask through the request_user_input tool", "Your turn ends when you reply", "Generative UI:"] {
+        for part in ["Sidebar titles:", "Run and preview workflow:", "File change tracking:", "Sidebar plan,", "Questions you ask through the request_user_input tool", "Your turn ends when you reply", "Generative UI:"] {
             assert!(text.contains(part), "{part}");
         }
         let chat = app_instructions(true);
@@ -1932,8 +1936,12 @@ async fn launch_operation_admitted(
         let host = if let Some(admission) = team.as_ref() {
             architect::host(app.clone(), session_id.clone(), stopped.clone(), admission)
         } else {
-            (config.provider == "codex")
-                .then(|| agent_tools::host(app.clone(), session_id.clone(), stopped.clone()))
+            Some(agent_tools::host_for(
+                &config.provider,
+                app.clone(),
+                session_id.clone(),
+                stopped.clone(),
+            ))
         };
         let team_tools_missing = team.is_some() && host.is_none();
         let host = agent_tools::with_jev(host, app.clone(), session_id.clone(), stopped.clone());
