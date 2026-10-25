@@ -1,0 +1,33 @@
+name: Sync upstream pandacode
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_PAT }}
+      - name: Configure git
+        run: git config user.name "sync-bot" && git config user.email "sync@local"
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/aicodeking/pandacode.git || true
+          git fetch upstream main
+      - name: Merge upstream
+        run: git merge upstream/main --no-edit || true
+      - name: Push to merge branch
+        run: |
+          git push origin HEAD:merge/upstream-auto || true
+      - name: Open draft PR on conflict / new merge
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_PAT }}
+        run: |
+          gh pr create --repo QucAnh/pandacode --base main --head merge/upstream-auto --title "Auto-merge upstream" --body "Daily sync from aicodeking/pandacode." --draft || true
